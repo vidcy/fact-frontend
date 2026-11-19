@@ -7,7 +7,6 @@ import {
   RotateCw,
   AlertCircle,
   Receipt,
-  CheckCircle2,
   Eye,
   EyeOff,
 } from 'lucide-react';
@@ -80,7 +79,7 @@ export function AdminLogin({ onLoginSuccess, apiBase }: AdminLoginProps) {
             Plataforma Soberana de Facturación Electrónica SUNAT UBL 2.1
           </p>
           <div className="inline-flex items-center gap-1.5 px-3 py-1 bg-white/20 rounded-full text-[11px] font-bold mt-3">
-            <ShieldCheck className="w-3.5 h-3.5" /> Acceso Exclusivo Administrador
+            <ShieldCheck className="w-3.5 h-3.5" /> Acceso Seguro al Sistema
           </div>
         </div>
 
@@ -104,7 +103,7 @@ export function AdminLogin({ onLoginSuccess, apiBase }: AdminLoginProps) {
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
                   className="w-full pl-10 pr-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-900 text-sm font-medium focus:bg-white focus:border-indigo-600 focus:ring-2 focus:ring-indigo-100 outline-none transition"
-                  placeholder="admin@ccoplex.com"
+                  placeholder="usuario@empresa.com"
                   required
                 />
               </div>
@@ -112,7 +111,7 @@ export function AdminLogin({ onLoginSuccess, apiBase }: AdminLoginProps) {
 
             {/* Campo: Contraseña */}
             <div className="space-y-1.5">
-              <label className="block text-slate-700 font-semibold">Contraseña Maestra</label>
+              <label className="block text-slate-700 font-semibold">Contraseña</label>
               <div className="relative">
                 <Lock className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
                 <input
@@ -147,7 +146,7 @@ export function AdminLogin({ onLoginSuccess, apiBase }: AdminLoginProps) {
                 </>
               ) : (
                 <>
-                  <span>Ingresar a la Consola Maestra</span>
+                  <span>Iniciar Sesión</span>
                   <ArrowRight className="w-4 h-4" />
                 </>
               )}
@@ -155,12 +154,9 @@ export function AdminLogin({ onLoginSuccess, apiBase }: AdminLoginProps) {
           </form>
 
           {/* Garantías de Seguridad */}
-          <div className="bg-slate-50 p-3 rounded-2xl border border-slate-200/60 flex items-center gap-3">
-            <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
-            <div className="text-[11px] text-slate-600">
-              <span className="font-bold text-slate-800">Seguridad Criptográfica</span>
-              <p>Sesión aislada con firma HMAC SHA-256 y PostgreSQL ACID</p>
-            </div>
+          <div className="bg-slate-50/80 p-3 rounded-2xl border border-slate-200/60 flex items-center justify-center gap-2 text-slate-500">
+            <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0" />
+            <span className="text-[11px] font-medium">Conexión cifrada y acceso seguro al sistema</span>
           </div>
         </div>
 

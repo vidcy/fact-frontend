@@ -29,12 +29,15 @@ import {
   Info,
   Cloud,
   Ban,
+  Users,
+  BarChart3,
 } from 'lucide-react';
 import { IntegrationModal } from './components/IntegrationModal';
 import { CompanyFormModal } from './components/CompanyFormModal';
 import { FiscalAuthenticatorModal } from './components/FiscalAuthenticatorModal';
 import { AdminLogin } from './components/AdminLogin';
 import { ConfirmModal } from './components/ConfirmModal';
+import { UsersManagement } from './components/UsersManagement';
 
 // ============================================================================
 // CONSTANTES GLOBALES Y URL DE API (SOPORTA LOCALHOST Y VERCEL PRODUCTION)
@@ -117,7 +120,7 @@ export function App() {
   });
 
   // 2. Navegación Principal por Pestañas
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'emitir' | 'documentos' | 'colas' | 'empresas' | 'api' | 'consola' | 'guia_sunat'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'emitir' | 'documentos' | 'colas' | 'empresas' | 'usuarios' | 'api' | 'consola' | 'guia_sunat'>('dashboard');
 
   // 3. Empresas y Emisor Activo Multi-Tenant
   const [companies, setCompanies] = useState<Company[]>([]);
@@ -314,15 +317,21 @@ export function App() {
     }
   };
 
-  // Consulta de empresas registradas
+  // Consulta de empresas registradas (con filtrado multi-tenant si el usuario tiene empresa asignada)
   const fetchCompanies = async () => {
     try {
       const res = await fetch(`${API_BASE}/companies`);
       const data = await res.json();
-      setCompanies(data);
-      if (data.length > 0) {
-        if (!currentCompany || !data.some((c: Company) => c.id === currentCompany.id)) {
-          setCurrentCompany(data[0]);
+      
+      const availableCompanies =
+        adminUser?.companyId && adminUser.role !== 'SUPER_ADMIN'
+          ? data.filter((c: Company) => c.id === adminUser.companyId)
+          : data;
+
+      setCompanies(availableCompanies);
+      if (availableCompanies.length > 0) {
+        if (!currentCompany || !availableCompanies.some((c: Company) => c.id === currentCompany.id)) {
+          setCurrentCompany(availableCompanies[0]);
         }
       } else {
         setCurrentCompany(null);
@@ -1039,6 +1048,16 @@ export function App() {
   const rejectedCount = documents.filter(d => d.status === 'REJECTED' || d.status === 'FAILED_RETRY').length;
   const successRate = documents.length > 0 ? Math.round((acceptedCount / documents.length) * 100) : 100;
 
+  // Métricas Analíticas Avanzadas por Tipo de Comprobante
+  const facturasList = documents.filter(d => d.document_type === '01');
+  const facturasTotal = facturasList.reduce((acc, d) => acc + (Number(d.total_amount) || 0), 0);
+  const boletasList = documents.filter(d => d.document_type === '03');
+  const boletasTotal = boletasList.reduce((acc, d) => acc + (Number(d.total_amount) || 0), 0);
+  const notasList = documents.filter(d => d.document_type === '07');
+  const notasTotal = notasList.reduce((acc, d) => acc + (Number(d.total_amount) || 0), 0);
+  const totalIgvAcumulado = documents.reduce((acc, d) => acc + (Number(d.total_igv) || 0), 0);
+  const totalGravadaAcumulado = documents.reduce((acc, d) => acc + (Number(d.total_gravada) || 0), 0);
+
   // --------------------------------------------------------------------------
   // CONTROL DE ACCESO: Si no está autenticado como Admin, mostrar Login
   // --------------------------------------------------------------------------
@@ -1214,6 +1233,16 @@ export function App() {
           <Building2 className="w-4 h-4" /> Empresas & Negocios ({companies.length})
         </button>
         <button
+          onClick={() => setActiveTab('usuarios')}
+          className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${
+            activeTab === 'usuarios'
+              ? 'border-indigo-600 text-indigo-600 bg-indigo-50/40'
+              : 'border-transparent text-slate-600 hover:text-slate-900'
+          }`}
+        >
+          <Users className="w-4 h-4" /> Usuarios & Accesos
+        </button>
+        <button
           onClick={() => { setActiveTab('colas'); fetchQueueStats(); }}
           className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${
             activeTab === 'colas'
@@ -1355,6 +1384,91 @@ export function App() {
                 </div>
                 <div className="text-xs text-slate-500 font-medium">
                   Multi-tenant con <span className="text-purple-600 font-bold">x-api-key</span> aislada
+                </div>
+              </div>
+            </div>
+
+            {/* PANEL DE ANÁLISIS FISCAL Y DESGLOSE TRIBUTARIO (SIRE / FORM 621) */}
+            <div className="bg-white border border-slate-200/80 rounded-3xl p-6 shadow-xs space-y-4">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-100 pb-3">
+                <div className="flex items-center gap-2">
+                  <div className="p-2 bg-indigo-50 text-indigo-600 rounded-xl">
+                    <BarChart3 className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h3 className="text-base font-bold text-slate-900">Análisis Fiscal & Distribución Tributaria</h3>
+                    <p className="text-xs text-slate-500">Resumen para Registro de Ventas e Ingresos Electrónicos (RVIE / SIRE)</p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => setActiveTab('usuarios')}
+                    className="flex items-center gap-1.5 text-xs font-bold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 px-3 py-1.5 rounded-xl transition cursor-pointer"
+                  >
+                    <Users className="w-3.5 h-3.5" /> Administrar Usuarios
+                  </button>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                {/* Facturas 01 */}
+                <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200/80 space-y-1">
+                  <div className="flex items-center justify-between text-xs font-bold text-slate-600">
+                    <span className="flex items-center gap-1.5">
+                      <span className="w-2.5 h-2.5 rounded-full bg-blue-500"></span> Facturas Electrónicas (01)
+                    </span>
+                    <span className="bg-blue-100 text-blue-800 px-2 py-0.5 rounded-md font-mono text-[10px]">
+                      {facturasList.length} emitidas
+                    </span>
+                  </div>
+                  <p className="text-xl font-black text-slate-900 font-mono mt-1">
+                    S/ {facturasTotal.toLocaleString('es-PE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  </p>
+                  <p className="text-[11px] text-slate-500">
+                    {totalInvoiced > 0 ? Math.round((facturasTotal / totalInvoiced) * 100) : 0}% del volumen total
+                  </p>
+                </div>
+
+                {/* Boletas 03 */}
+                <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200/80 space-y-1">
+                  <div className="flex items-center justify-between text-xs font-bold text-slate-600">
+                    <span className="flex items-center gap-1.5">
+                      <span className="w-2.5 h-2.5 rounded-full bg-emerald-500"></span> Boletas de Venta (03)
+                    </span>
+                    <span className="bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded-md font-mono text-[10px]">
+                      {boletasList.length} emitidas
+                    </span>
+                  </div>
+                  <p className="text-xl font-black text-slate-900 font-mono mt-1">
+                    S/ {boletasTotal.toLocaleString('es-PE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  </p>
+                  <p className="text-[11px] text-slate-500">
+                    {totalInvoiced > 0 ? Math.round((boletasTotal / totalInvoiced) * 100) : 0}% del volumen total
+                  </p>
+                </div>
+
+                {/* Desglose Fiscal SUNAT */}
+                <div className="p-4 rounded-2xl bg-indigo-50/50 border border-indigo-100 space-y-1">
+                  <div className="flex items-center justify-between text-xs font-bold text-indigo-900">
+                    <span>Liquidación Tributaria</span>
+                    <span className="text-[10px] bg-indigo-200/60 text-indigo-900 px-2 py-0.5 rounded-md font-bold">
+                      IGV 18%
+                    </span>
+                  </div>
+                  <div className="flex justify-between items-center text-xs text-slate-600 pt-1">
+                    <span>Base Gravada:</span>
+                    <span className="font-mono font-bold text-slate-900">S/ {totalGravadaAcumulado.toLocaleString('es-PE', { minimumFractionDigits: 2 })}</span>
+                  </div>
+                  <div className="flex justify-between items-center text-xs text-slate-600">
+                    <span>IGV Liquidado:</span>
+                    <span className="font-mono font-bold text-indigo-700">S/ {totalIgvAcumulado.toLocaleString('es-PE', { minimumFractionDigits: 2 })}</span>
+                  </div>
+                  {notasList.length > 0 && (
+                    <div className="flex justify-between items-center text-[11px] text-rose-600 pt-1 border-t border-indigo-100">
+                      <span>Notas de Crédito ({notasList.length}):</span>
+                      <span className="font-mono font-bold">- S/ {notasTotal.toFixed(2)}</span>
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
@@ -2715,6 +2829,18 @@ Idempotency-Key: cco_order_987654 (Opcional pero recomendado para cero duplicado
               </div>
             </div>
           </div>
+        )}
+
+        {/* ================================================================== */}
+        {/* TAB 9: GESTIÓN DE USUARIOS Y ROLES RBAC */}
+        {/* ================================================================== */}
+        {activeTab === 'usuarios' && (
+          <UsersManagement
+            apiBase={API_BASE}
+            adminToken={adminToken}
+            companies={companies}
+            onShowAlert={(type, message) => setFeedbackAlert({ type, message })}
+          />
         )}
       </main>
 
