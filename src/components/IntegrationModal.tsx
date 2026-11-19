@@ -123,9 +123,6 @@ export function IntegrationModal({ isOpen, onClose, company, apiBase, onCompanyU
     businessReason: company.razon_social,
     ccofactUrl: ccofactEmitirUrl,
     ccofactApiKey: company.api_key,
-    // Compatibilidad con campos existentes de Control Finanzas:
-    nubefactUrl: ccofactEmitirUrl,
-    nubefactToken: company.api_key,
   };
 
   const envFormat = `# =====================================================================
@@ -141,9 +138,6 @@ CCOFACT_ENV_MODE=${company.env_mode}
 CCOFACT_EMITIR_URL=${ccofactEmitirUrl}
 CCOFACT_STATUS_URL=${ccofactStatusUrl}
 CCOFACT_API_KEY=${company.api_key}
-# Compatibilidad con formulario existente de Control Finanzas:
-NUBEFACT_URL=${ccofactEmitirUrl}
-NUBEFACT_TOKEN=${company.api_key}
 `;
 
   const curlSnippet = `# 1. Ping / Verificación de API Key y Series Activas (GET)
