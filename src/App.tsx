@@ -31,6 +31,8 @@ import {
   Ban,
   Users,
   BarChart3,
+  Truck,
+  MapPin,
 } from 'lucide-react';
 import { IntegrationModal } from './components/IntegrationModal';
 import { CompanyFormModal } from './components/CompanyFormModal';
@@ -120,7 +122,7 @@ export function App() {
   });
 
   // 2. Navegación Principal por Pestañas
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'emitir' | 'documentos' | 'colas' | 'empresas' | 'usuarios' | 'api' | 'consola' | 'guia_sunat'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'emitir' | 'documentos' | 'guias' | 'colas' | 'empresas' | 'usuarios' | 'api' | 'consola' | 'guia_sunat'>('dashboard');
 
   // 3. Empresas y Emisor Activo Multi-Tenant
   const [companies, setCompanies] = useState<Company[]>([]);
@@ -173,13 +175,34 @@ export function App() {
   const [previewHtml, setPreviewHtml] = useState<string>('');
   const [previewLoading, setPreviewLoading] = useState(false);
 
-  // 7. Formulario de Emisión POS
-  const [docType, setDocType] = useState<'01' | '03' | '07' | '08'>('01');
+  // 7. Formulario de Emisión POS & GRE
+  const [docType, setDocType] = useState<'01' | '03' | '07' | '08' | '09'>('01');
   const [series, setSeries] = useState('F001');
   const [currency, setCurrency] = useState<'PEN' | 'USD'>('PEN');
   const [paymentType, setPaymentType] = useState('Contado');
   const [sendNow, setSendNow] = useState(true);
   const [idempotencyKey, setIdempotencyKey] = useState('');
+
+  // 7.1. Datos Específicos para Guías de Remisión Electrónica (GRE - Tipo 09)
+  const [motivoTraslado, setMotivoTraslado] = useState('01');
+  const [motivoTrasladoDesc, setMotivoTrasladoDesc] = useState('Venta');
+  const [modalidadTraslado, setModalidadTraslado] = useState<'01' | '02'>('02');
+  const [fechaInicioTraslado, setFechaInicioTraslado] = useState<string>(() => new Date().toISOString().split('T')[0]);
+  const [pesoBrutoTotal, setPesoBrutoTotal] = useState<number>(10.0);
+  const [numeroBultos, setNumeroBultos] = useState<number>(1);
+  const [puntoPartidaDireccion, setPuntoPartidaDireccion] = useState('');
+  const [puntoPartidaUbigeo, setPuntoPartidaUbigeo] = useState('150101');
+  const [puntoLlegadaDireccion, setPuntoLlegadaDireccion] = useState('');
+  const [puntoLlegadaUbigeo, setPuntoLlegadaUbigeo] = useState('150101');
+  // Transporte Público (Modalidad 01)
+  const [transportistaDoc, setTransportistaDoc] = useState('');
+  const [transportistaNombre, setTransportistaNombre] = useState('');
+  const [transportistaMtc, setTransportistaMtc] = useState('');
+  // Transporte Privado (Modalidad 02)
+  const [conductorDoc, setConductorDoc] = useState('');
+  const [conductorNombre, setConductorNombre] = useState('');
+  const [conductorLicencia, setConductorLicencia] = useState('');
+  const [vehiculoPlaca, setVehiculoPlaca] = useState('');
 
   // 8. Referencias Tributarias para Notas de Crédito (07) y Débito (08)
   const [refDocType, setRefDocType] = useState<'01' | '03'>('01');
@@ -267,6 +290,12 @@ export function App() {
       fetchDocuments();
       fetchQueueStats();
       updateDefaultSeries(docType);
+      if (currentCompany.direccion && !puntoPartidaDireccion) {
+        setPuntoPartidaDireccion(currentCompany.direccion);
+      }
+      if (currentCompany.ubigeo && (!puntoPartidaUbigeo || puntoPartidaUbigeo === '150101')) {
+        setPuntoPartidaUbigeo(currentCompany.ubigeo);
+      }
     }
   }, [currentCompany]);
 
@@ -280,6 +309,8 @@ export function App() {
       setSeries(refDocType === '01' ? 'FC01' : 'BC01');
     } else if (type === '08') {
       setSeries(refDocType === '01' ? 'FD01' : 'BD01');
+    } else if (type === '09') {
+      setSeries('T001');
     }
   };
 
@@ -603,6 +634,75 @@ export function App() {
       }
     }
 
+    if (docType === '09') {
+      if (!puntoPartidaDireccion.trim()) {
+        setFeedbackAlert({
+          type: 'error',
+          message: 'Debe ingresar la dirección del Punto de Partida para la Guía de Remisión.'
+        });
+        return;
+      }
+      if (!puntoPartidaUbigeo || !/^\d{6}$/.test(puntoPartidaUbigeo.trim())) {
+        setFeedbackAlert({
+          type: 'error',
+          message: 'El Ubigeo de partida debe ser un código de 6 dígitos numéricos (ej. 150101).'
+        });
+        return;
+      }
+      if (!puntoLlegadaDireccion.trim()) {
+        setFeedbackAlert({
+          type: 'error',
+          message: 'Debe ingresar la dirección del Punto de Llegada para la Guía de Remisión.'
+        });
+        return;
+      }
+      if (!puntoLlegadaUbigeo || !/^\d{6}$/.test(puntoLlegadaUbigeo.trim())) {
+        setFeedbackAlert({
+          type: 'error',
+          message: 'El Ubigeo de llegada debe ser un código de 6 dígitos numéricos (ej. 150101).'
+        });
+        return;
+      }
+      if (Number(pesoBrutoTotal) <= 0) {
+        setFeedbackAlert({
+          type: 'error',
+          message: 'El Peso Bruto Total debe ser mayor a 0 KGM.'
+        });
+        return;
+      }
+      if (modalidadTraslado === '01') {
+        if (!transportistaDoc.trim() || transportistaDoc.trim().length !== 11) {
+          setFeedbackAlert({
+            type: 'error',
+            message: 'Para Transporte Público debe ingresar el RUC de 11 dígitos de la empresa transportista.'
+          });
+          return;
+        }
+        if (!transportistaNombre.trim()) {
+          setFeedbackAlert({
+            type: 'error',
+            message: 'Debe ingresar la Razón Social de la empresa transportista.'
+          });
+          return;
+        }
+      } else {
+        if (!conductorDoc.trim() || conductorDoc.trim().length !== 8) {
+          setFeedbackAlert({
+            type: 'error',
+            message: 'Para Transporte Privado debe ingresar el DNI de 8 dígitos del conductor.'
+          });
+          return;
+        }
+        if (!vehiculoPlaca.trim()) {
+          setFeedbackAlert({
+            type: 'error',
+            message: 'Debe ingresar el número de placa del vehículo de transporte.'
+          });
+          return;
+        }
+      }
+    }
+
     const isNote = docType === '07' || docType === '08';
     const payload: any = {
       idempotency_key: idempotencyKey.trim() || undefined,
@@ -638,7 +738,49 @@ export function App() {
       };
     }
 
-    const docName = docType === '01' ? 'Factura Electrónica' : docType === '03' ? 'Boleta de Venta Electrónica' : docType === '07' ? 'Nota de Crédito' : 'Nota de Débito';
+    if (docType === '09') {
+      const guiaPayload: any = {
+        motivo_traslado: motivoTraslado,
+        motivo_traslado_descripcion: motivoTrasladoDesc,
+        modalidad_traslado: modalidadTraslado,
+        fecha_inicio_traslado: fechaInicioTraslado,
+        peso_bruto_total: Number(pesoBrutoTotal),
+        unidad_peso: 'KGM',
+        numero_bultos: Number(numeroBultos),
+        punto_partida: {
+          ubigeo: puntoPartidaUbigeo.trim(),
+          direccion: puntoPartidaDireccion.trim(),
+        },
+        punto_llegada: {
+          ubigeo: puntoLlegadaUbigeo.trim(),
+          direccion: puntoLlegadaDireccion.trim(),
+        },
+      };
+
+      if (modalidadTraslado === '01') {
+        guiaPayload.transportista = {
+          tipo_documento: '6',
+          numero_documento: transportistaDoc.trim(),
+          razon_social: transportistaNombre.trim(),
+          numero_mtc: transportistaMtc.trim() || undefined,
+        };
+      } else {
+        guiaPayload.conductor = {
+          tipo_documento: '1',
+          numero_documento: conductorDoc.trim(),
+          nombres: conductorNombre.trim(),
+          licencia: conductorLicencia.trim(),
+        };
+        guiaPayload.vehiculo = {
+          placa: vehiculoPlaca.trim().toUpperCase(),
+        };
+      }
+
+      payload.guia_datos = guiaPayload;
+      payload.metadata = { guia_datos: guiaPayload };
+    }
+
+    const docName = docType === '01' ? 'Factura Electrónica' : docType === '03' ? 'Boleta de Venta Electrónica' : docType === '07' ? 'Nota de Crédito' : docType === '08' ? 'Nota de Débito' : 'Guía de Remisión Remitente (09)';
     const isProd = currentCompany.env_mode === 'PRODUCCION';
 
     setConfirmConfig({
@@ -653,8 +795,14 @@ export function App() {
         { label: 'Emisor Tributario', value: `${currentCompany.razon_social} (RUC ${currentCompany.ruc})` },
         { label: 'Tipo de Comprobante', value: docName },
         { label: 'Serie y Correlativo', value: `${series} (Siguiente Correlativo Atómico)` },
-        { label: 'Cliente Receptor', value: `${clientName} (${clientDocType === '6' ? 'RUC' : clientDocType === '1' ? 'DNI' : 'Doc'}: ${cleanDocNum})` },
-        { label: 'Total a Cobrar', value: `${currency} ${totals.total}` },
+        { label: docType === '09' ? 'Destinatario' : 'Cliente Receptor', value: `${clientName} (${clientDocType === '6' ? 'RUC' : clientDocType === '1' ? 'DNI' : 'Doc'}: ${cleanDocNum})` },
+        ...(docType === '09' ? [
+          { label: 'Motivo Traslado', value: `${motivoTraslado} - ${motivoTrasladoDesc}` },
+          { label: 'Modalidad', value: modalidadTraslado === '01' ? 'Pública (Empresa Transportista)' : 'Privada (Vehículo Propio)' },
+          { label: 'Carga', value: `${pesoBrutoTotal} KGM (${numeroBultos} bultos)` },
+        ] : [
+          { label: 'Total a Cobrar', value: `${currency} ${totals.total}` },
+        ]),
         { label: 'Transmisión SUNAT', value: sendNow ? 'Inmediata vía SOAP Web Service' : 'Cola de Contingencia' },
         { label: 'Ambiente Fiscal', value: currentCompany.env_mode },
       ],
@@ -1223,6 +1371,16 @@ export function App() {
           <FileText className="w-4 h-4" /> Comprobantes ({documents.length})
         </button>
         <button
+          onClick={() => { setActiveTab('guias'); fetchDocuments(); }}
+          className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${
+            activeTab === 'guias'
+              ? 'border-indigo-600 text-indigo-600 bg-indigo-50/40'
+              : 'border-transparent text-slate-600 hover:text-slate-900'
+          }`}
+        >
+          <Truck className="w-4 h-4 text-indigo-600" /> Guías de Remisión ({documents.filter(d => d.document_type === '09').length})
+        </button>
+        <button
           onClick={() => { setActiveTab('empresas'); fetchCompanies(); }}
           className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${
             activeTab === 'empresas'
@@ -1621,7 +1779,7 @@ export function App() {
                   <Send className="w-5 h-5 text-indigo-600" /> Emisión Universal de Comprobantes SUNAT
                 </h2>
                 <p className="text-xs text-slate-500">
-                  Emite Facturas (01), Boletas (03), Notas de Crédito (07) y Notas de Débito (08)
+                  Emite Facturas (01), Boletas (03), Notas de Crédito (07), Notas de Débito (08) y Guías de Remisión (09)
                 </p>
               </div>
 
@@ -1663,6 +1821,7 @@ export function App() {
                     <option value="03">03 - BOLETA DE VENTA</option>
                     <option value="07">07 - NOTA DE CRÉDITO</option>
                     <option value="08">08 - NOTA DE DÉBITO</option>
+                    <option value="09">09 - GUÍA DE REMISIÓN REMITENTE</option>
                   </select>
                 </div>
 
@@ -1826,6 +1985,262 @@ export function App() {
                 </div>
               )}
 
+              {/* SECCIÓN GUÍA DE REMISIÓN REMITENTE (09) */}
+              {docType === '09' && (
+                <div className="border border-indigo-200 bg-indigo-50/40 rounded-2xl p-5 space-y-4">
+                  <div className="flex items-center gap-2 text-indigo-900 font-bold text-xs uppercase tracking-wider">
+                    <Truck className="w-4 h-4 text-indigo-600" />
+                    <span>Datos de Traslado y Despacho (Guía de Remisión Remitente - UBL 2.1)</span>
+                  </div>
+
+                  {/* Parámetros Básicos del Traslado */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
+                    <div>
+                      <label className="block text-slate-700 font-semibold mb-1">Motivo de Traslado</label>
+                      <select
+                        value={motivoTraslado}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setMotivoTraslado(val);
+                          const labels: Record<string, string> = {
+                            '01': 'Venta',
+                            '02': 'Compra',
+                            '04': 'Traslado entre establecimientos de la misma empresa',
+                            '08': 'Importación',
+                            '09': 'Exportación',
+                            '13': 'Otros traslados',
+                          };
+                          setMotivoTrasladoDesc(labels[val] || 'Venta');
+                        }}
+                        className="w-full bg-white border border-indigo-200 rounded-xl px-3 py-2 text-slate-900 font-semibold outline-none"
+                      >
+                        <option value="01">01 - Venta</option>
+                        <option value="02">02 - Compra</option>
+                        <option value="04">04 - Traslado entre locales</option>
+                        <option value="08">08 - Importación</option>
+                        <option value="09">09 - Exportación</option>
+                        <option value="13">13 - Otros motivos</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="block text-slate-700 font-semibold mb-1">Modalidad de Traslado</label>
+                      <select
+                        value={modalidadTraslado}
+                        onChange={(e) => setModalidadTraslado(e.target.value as any)}
+                        className="w-full bg-white border border-indigo-200 rounded-xl px-3 py-2 text-slate-900 font-semibold outline-none"
+                      >
+                        <option value="02">02 - Privado (Vehículo y Conductor Propio)</option>
+                        <option value="01">01 - Público (Empresa Transportista)</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="block text-slate-700 font-semibold mb-1">Fecha Inicio de Traslado</label>
+                      <input
+                        type="date"
+                        value={fechaInicioTraslado}
+                        onChange={(e) => setFechaInicioTraslado(e.target.value)}
+                        className="w-full bg-white border border-indigo-200 rounded-xl px-3 py-2 text-slate-900 font-semibold outline-none"
+                        required
+                      />
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2">
+                      <div>
+                        <label className="block text-slate-700 font-semibold mb-1">Peso (KGM)</label>
+                        <input
+                          type="number"
+                          step="0.01"
+                          min="0.01"
+                          value={pesoBrutoTotal}
+                          onChange={(e) => setPesoBrutoTotal(parseFloat(e.target.value) || 0)}
+                          className="w-full bg-white border border-indigo-200 rounded-xl px-3 py-2 font-mono font-bold text-slate-900 outline-none"
+                          required
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-slate-700 font-semibold mb-1">N° Bultos</label>
+                        <input
+                          type="number"
+                          min="1"
+                          value={numeroBultos}
+                          onChange={(e) => setNumeroBultos(parseInt(e.target.value, 10) || 1)}
+                          className="w-full bg-white border border-indigo-200 rounded-xl px-3 py-2 font-mono font-bold text-slate-900 outline-none"
+                          required
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Puntos de Partida y Llegada */}
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs pt-1">
+                    <div className="bg-white/90 p-3.5 rounded-xl border border-indigo-100 space-y-2">
+                      <div className="flex items-center gap-1.5 text-indigo-700 font-bold">
+                        <MapPin className="w-3.5 h-3.5 text-indigo-600" />
+                        <span>Punto de Partida (Origen de la Carga)</span>
+                      </div>
+                      <div className="grid grid-cols-3 gap-2">
+                        <div className="col-span-1">
+                          <label className="block text-[11px] text-slate-500 font-medium mb-1">Ubigeo (6 dígitos)</label>
+                          <input
+                            type="text"
+                            maxLength={6}
+                            value={puntoPartidaUbigeo}
+                            onChange={(e) => setPuntoPartidaUbigeo(e.target.value.replace(/\D/g, ''))}
+                            placeholder="150101"
+                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 font-mono text-xs text-slate-900 outline-none"
+                            required
+                          />
+                        </div>
+                        <div className="col-span-2">
+                          <label className="block text-[11px] text-slate-500 font-medium mb-1">Dirección de Partida</label>
+                          <input
+                            type="text"
+                            value={puntoPartidaDireccion}
+                            onChange={(e) => setPuntoPartidaDireccion(e.target.value)}
+                            placeholder="Av. Ejemplo 123, Lima"
+                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-slate-900 outline-none"
+                            required
+                          />
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="bg-white/90 p-3.5 rounded-xl border border-indigo-100 space-y-2">
+                      <div className="flex items-center gap-1.5 text-indigo-700 font-bold">
+                        <MapPin className="w-3.5 h-3.5 text-emerald-600" />
+                        <span>Punto de Llegada (Destino de la Carga)</span>
+                      </div>
+                      <div className="grid grid-cols-3 gap-2">
+                        <div className="col-span-1">
+                          <label className="block text-[11px] text-slate-500 font-medium mb-1">Ubigeo (6 dígitos)</label>
+                          <input
+                            type="text"
+                            maxLength={6}
+                            value={puntoLlegadaUbigeo}
+                            onChange={(e) => setPuntoLlegadaUbigeo(e.target.value.replace(/\D/g, ''))}
+                            placeholder="150101"
+                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 font-mono text-xs text-slate-900 outline-none"
+                            required
+                          />
+                        </div>
+                        <div className="col-span-2">
+                          <label className="block text-[11px] text-slate-500 font-medium mb-1">Dirección de Llegada</label>
+                          <input
+                            type="text"
+                            value={puntoLlegadaDireccion}
+                            onChange={(e) => setPuntoLlegadaDireccion(e.target.value)}
+                            placeholder="Av. Destino 456, Callao"
+                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-slate-900 outline-none"
+                            required
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Operador de Transporte según Modalidad */}
+                  {modalidadTraslado === '01' ? (
+                    <div className="bg-white/90 p-3.5 rounded-xl border border-indigo-100 space-y-2 text-xs">
+                      <div className="flex items-center gap-1.5 text-indigo-700 font-bold">
+                        <Truck className="w-3.5 h-3.5 text-indigo-600" />
+                        <span>Datos de la Empresa Transportista (Transporte Público)</span>
+                      </div>
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                        <div>
+                          <label className="block text-[11px] text-slate-500 font-medium mb-1">RUC Transportista (11 dígitos)</label>
+                          <input
+                            type="text"
+                            maxLength={11}
+                            value={transportistaDoc}
+                            onChange={(e) => setTransportistaDoc(e.target.value.replace(/\D/g, ''))}
+                            placeholder="20123456789"
+                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 font-mono text-xs text-slate-900 outline-none"
+                            required
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[11px] text-slate-500 font-medium mb-1">Razón Social Transportista</label>
+                          <input
+                            type="text"
+                            value={transportistaNombre}
+                            onChange={(e) => setTransportistaNombre(e.target.value)}
+                            placeholder="TRANSPORTES LOGISTICOS S.A.C."
+                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-slate-900 outline-none"
+                            required
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[11px] text-slate-500 font-medium mb-1">N° Registro MTC (Opcional)</label>
+                          <input
+                            type="text"
+                            value={transportistaMtc}
+                            onChange={(e) => setTransportistaMtc(e.target.value)}
+                            placeholder="MTC-12345"
+                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-slate-900 outline-none"
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="bg-white/90 p-3.5 rounded-xl border border-indigo-100 space-y-2 text-xs">
+                      <div className="flex items-center gap-1.5 text-indigo-700 font-bold">
+                        <Users className="w-3.5 h-3.5 text-indigo-600" />
+                        <span>Datos del Conductor y Vehículo (Transporte Privado)</span>
+                      </div>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
+                        <div>
+                          <label className="block text-[11px] text-slate-500 font-medium mb-1">DNI Conductor (8 dígitos)</label>
+                          <input
+                            type="text"
+                            maxLength={8}
+                            value={conductorDoc}
+                            onChange={(e) => setConductorDoc(e.target.value.replace(/\D/g, ''))}
+                            placeholder="45678901"
+                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 font-mono text-xs text-slate-900 outline-none"
+                            required
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[11px] text-slate-500 font-medium mb-1">Nombres y Apellidos</label>
+                          <input
+                            type="text"
+                            value={conductorNombre}
+                            onChange={(e) => setConductorNombre(e.target.value)}
+                            placeholder="JUAN PEREZ CHOQUE"
+                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-slate-900 outline-none"
+                            required
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[11px] text-slate-500 font-medium mb-1">Licencia de Conducir</label>
+                          <input
+                            type="text"
+                            value={conductorLicencia}
+                            onChange={(e) => setConductorLicencia(e.target.value.toUpperCase())}
+                            placeholder="Q45678901"
+                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 font-mono text-xs text-slate-900 outline-none"
+                            required
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[11px] text-slate-500 font-medium mb-1">Placa del Vehículo</label>
+                          <input
+                            type="text"
+                            value={vehiculoPlaca}
+                            onChange={(e) => setVehiculoPlaca(e.target.value.toUpperCase())}
+                            placeholder="ABC-123"
+                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 font-mono font-bold text-xs text-slate-900 outline-none"
+                            required
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
               {/* Idempotencia Opcional */}
               <div className="bg-slate-50 p-3 rounded-xl border border-slate-200 flex items-center gap-3">
                 <Hash className="w-5 h-5 text-indigo-600 shrink-0" />
@@ -1843,7 +2258,9 @@ export function App() {
 
               {/* Datos del Cliente */}
               <div className="border border-slate-200 rounded-2xl p-4 bg-slate-50/50 space-y-4">
-                <h4 className="text-xs font-bold text-slate-700 uppercase tracking-wider">Datos del Adquiriente / Cliente</h4>
+                <h4 className="text-xs font-bold text-slate-700 uppercase tracking-wider">
+                  {docType === '09' ? 'Datos del Destinatario (Receptor de la Carga)' : 'Datos del Adquiriente / Cliente'}
+                </h4>
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
                   <div>
                     <label className="block font-semibold text-slate-700 mb-1">Tipo de Documento</label>
@@ -2093,7 +2510,7 @@ export function App() {
                           {doc.full_number}
                         </td>
                         <td className="py-3 px-4 font-semibold text-slate-800">
-                          {doc.document_type === '01' ? 'Factura' : doc.document_type === '03' ? 'Boleta' : doc.document_type === '07' ? 'Nota Crédito' : 'Nota Débito'}
+                          {doc.document_type === '01' ? 'Factura' : doc.document_type === '03' ? 'Boleta' : doc.document_type === '07' ? 'Nota Crédito' : doc.document_type === '08' ? 'Nota Débito' : 'Guía Remisión'}
                         </td>
                         <td className="py-3 px-4">
                           <div className="font-semibold text-slate-900">{doc.client_name}</div>
@@ -2205,6 +2622,250 @@ export function App() {
                       <tr>
                         <td colSpan={7} className="py-12 text-center text-slate-400">
                           No hay comprobantes registrados para este emisor.
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ================================================================== */}
+        {/* TAB: GUÍAS DE REMISIÓN ELECTRÓNICA (GRE - TIPO 09) */}
+        {/* ================================================================== */}
+        {activeTab === 'guias' && (
+          <div className="space-y-6">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+              <div>
+                <h2 className="text-xl font-bold text-slate-900 flex items-center gap-2">
+                  <Truck className="w-6 h-6 text-indigo-600" />
+                  Módulo Oficial de Guías de Remisión Electrónica (GRE Remitente)
+                </h2>
+                <p className="text-xs text-slate-500">
+                  Despacho oficial de mercaderías con XML UBL 2.1 DespatchAdvice, firma digital X.509 y CDR de SUNAT
+                </p>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={fetchDocuments}
+                  className="flex items-center gap-1.5 bg-white hover:bg-slate-50 text-slate-700 text-xs font-semibold px-3.5 py-2.5 rounded-xl border border-slate-200 shadow-2xs transition cursor-pointer"
+                >
+                  <RefreshCw className="w-3.5 h-3.5 text-indigo-600" /> Actualizar
+                </button>
+                <button
+                  onClick={() => {
+                    setDocType('09');
+                    updateDefaultSeries('09');
+                    setActiveTab('emitir');
+                  }}
+                  className="flex items-center gap-1.5 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white text-xs font-bold px-4 py-2.5 rounded-xl shadow-md transition cursor-pointer shrink-0"
+                >
+                  <Plus className="w-4 h-4" /> Emitir Guía de Remisión
+                </button>
+              </div>
+            </div>
+
+            {/* Tarjetas KPI para Guías */}
+            {(() => {
+              const guias = documents.filter(d => d.document_type === '09');
+              const guiasAceptadas = guias.filter(d => d.status.includes('ACCEPTED')).length;
+              const guiasPendientes = guias.filter(d => d.status === 'QUEUED' || d.status === 'SENDING').length;
+              const guiasRechazadas = guias.filter(d => d.status === 'REJECTED' || d.status === 'FAILED_RETRY').length;
+
+              return (
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                  <div className="bg-white border border-slate-200/80 rounded-3xl p-5 space-y-2 shadow-xs">
+                    <div className="flex items-center justify-between text-slate-500">
+                      <span className="text-xs font-bold uppercase tracking-wider">Total Guías</span>
+                      <div className="p-2 bg-indigo-50 text-indigo-600 rounded-xl">
+                        <Truck className="w-4 h-4" />
+                      </div>
+                    </div>
+                    <div className="text-2xl font-black text-slate-900 font-mono">
+                      {guias.length}
+                    </div>
+                    <div className="text-xs text-slate-500 font-medium">
+                      Guías Remitente tipo <span className="font-bold text-indigo-600">09</span>
+                    </div>
+                  </div>
+
+                  <div className="bg-white border border-slate-200/80 rounded-3xl p-5 space-y-2 shadow-xs">
+                    <div className="flex items-center justify-between text-slate-500">
+                      <span className="text-xs font-bold uppercase tracking-wider">Aceptadas SUNAT</span>
+                      <div className="p-2 bg-emerald-50 text-emerald-600 rounded-xl">
+                        <CheckCircle2 className="w-4 h-4" />
+                      </div>
+                    </div>
+                    <div className="text-2xl font-black text-emerald-600 font-mono">
+                      {guiasAceptadas}
+                    </div>
+                    <div className="text-xs text-slate-500 font-medium">
+                      Con CDR de Aprobación Oficial
+                    </div>
+                  </div>
+
+                  <div className="bg-white border border-slate-200/80 rounded-3xl p-5 space-y-2 shadow-xs">
+                    <div className="flex items-center justify-between text-slate-500">
+                      <span className="text-xs font-bold uppercase tracking-wider">En Cola / Transmisión</span>
+                      <div className="p-2 bg-amber-50 text-amber-600 rounded-xl">
+                        <Clock className="w-4 h-4" />
+                      </div>
+                    </div>
+                    <div className="text-2xl font-black text-amber-600 font-mono">
+                      {guiasPendientes}
+                    </div>
+                    <div className="text-xs text-slate-500 font-medium">
+                      Endpoint <span className="font-bold text-amber-600">e-guiaremision</span>
+                    </div>
+                  </div>
+
+                  <div className="bg-white border border-slate-200/80 rounded-3xl p-5 space-y-2 shadow-xs">
+                    <div className="flex items-center justify-between text-slate-500">
+                      <span className="text-xs font-bold uppercase tracking-wider">Observadas / Rechazadas</span>
+                      <div className="p-2 bg-rose-50 text-rose-600 rounded-xl">
+                        <AlertCircle className="w-4 h-4" />
+                      </div>
+                    </div>
+                    <div className="text-2xl font-black text-rose-600 font-mono">
+                      {guiasRechazadas}
+                    </div>
+                    <div className="text-xs text-slate-500 font-medium">
+                      Con diagnóstico de corrección
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* Tabla de Guías de Remisión */}
+            <div className="bg-white border border-slate-200/80 rounded-3xl overflow-hidden shadow-xs">
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead>
+                    <tr className="border-b border-slate-200 text-slate-500 bg-slate-50/80 font-bold">
+                      <th className="py-3 px-4">Guía Remisión</th>
+                      <th className="py-3 px-4">Destinatario (Receptor)</th>
+                      <th className="py-3 px-4">Fecha Emisión</th>
+                      <th className="py-3 px-4 text-center">Estado SUNAT</th>
+                      <th className="py-3 px-4 text-right">Acciones Oficiales</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {documents
+                      .filter(d => d.document_type === '09')
+                      .map(doc => (
+                        <tr key={doc.id} className="hover:bg-slate-50/80 transition">
+                          <td className="py-3 px-4">
+                            <div className="font-mono font-bold text-indigo-600">{doc.full_number}</div>
+                            <span className="text-[10px] bg-indigo-50 text-indigo-700 px-1.5 py-0.5 rounded font-semibold border border-indigo-200">
+                              GRE Remitente
+                            </span>
+                          </td>
+                          <td className="py-3 px-4">
+                            <div className="font-semibold text-slate-900">{doc.client_name}</div>
+                            <div className="text-[10px] text-slate-400 font-mono">{doc.client_doc_number}</div>
+                          </td>
+                          <td className="py-3 px-4 text-slate-500 font-mono text-[11px]">
+                            {doc.issue_date} {doc.issue_time}
+                          </td>
+                          <td className="py-3 px-4 text-center">
+                            <button
+                              type="button"
+                              onClick={() => setDiagnosticDoc(doc)}
+                              title="Haz clic para ver el Diagnóstico Tributario Oficial retornado por SUNAT"
+                              className={`text-[10px] font-bold px-2.5 py-0.5 rounded-full cursor-pointer hover:opacity-85 transition inline-flex items-center gap-1 ${
+                                doc.status === 'ANULADO'
+                                  ? 'bg-rose-100 text-rose-800 border border-rose-300 font-extrabold line-through'
+                                  : doc.status.includes('ACCEPTED')
+                                  ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                                  : doc.status === 'QUEUED'
+                                  ? 'bg-amber-50 text-amber-700 border border-amber-200'
+                                  : 'bg-rose-50 text-rose-700 border border-rose-200'
+                              }`}
+                            >
+                              <span>{doc.status}</span>
+                              <Info className="w-2.5 h-2.5 opacity-60" />
+                            </button>
+                          </td>
+                          <td className="py-3 px-4 text-right">
+                            <div className="flex items-center justify-end gap-1.5">
+                              <button
+                                onClick={() => openPreview(doc)}
+                                className="p-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition cursor-pointer"
+                                title="Ver / Imprimir Representación Oficial de Guía"
+                              >
+                                <Printer className="w-3.5 h-3.5" />
+                              </button>
+
+                              <a
+                                href={`${API_BASE}/documents/${doc.id}/xml`}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="p-1.5 bg-amber-50 hover:bg-amber-100 text-amber-700 rounded-lg transition"
+                                title="Descargar XML DespatchAdvice UBL 2.1 Firmado"
+                              >
+                                <Download className="w-3.5 h-3.5" />
+                              </a>
+
+                              <a
+                                href={`${API_BASE}/documents/${doc.id}/cdr`}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="p-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 rounded-lg transition"
+                                title="Descargar CDR Oficial SUNAT"
+                              >
+                                <Download className="w-3.5 h-3.5" />
+                              </a>
+
+                              {doc.status !== 'ACCEPTED' && doc.status !== 'ANULADO' && (
+                                <button
+                                  onClick={() => handleConsultarCdr(doc.id)}
+                                  className="p-1.5 bg-blue-50 hover:bg-blue-100 text-blue-700 rounded-lg transition cursor-pointer"
+                                  title="Consultar CDR Oficial en SUNAT"
+                                >
+                                  <Search className="w-3.5 h-3.5" />
+                                </button>
+                              )}
+
+                              {doc.status !== 'ACCEPTED' && doc.status !== 'ANULADO' && (
+                                <button
+                                  onClick={() => handleRetry(doc.id)}
+                                  className="p-1.5 bg-amber-50 hover:bg-amber-100 text-amber-700 rounded-lg transition cursor-pointer"
+                                  title="Reintentar Envío a SUNAT Guías"
+                                >
+                                  <RotateCw className="w-3.5 h-3.5" />
+                                </button>
+                              )}
+
+                              <button
+                                onClick={() => handleDeleteDocument(doc)}
+                                className="p-1.5 bg-slate-100 hover:bg-rose-100 text-slate-500 hover:text-rose-600 rounded-lg transition cursor-pointer"
+                                title="Eliminar registro de la Base de Datos"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                    {documents.filter(d => d.document_type === '09').length === 0 && (
+                      <tr>
+                        <td colSpan={5} className="py-12 text-center text-slate-400">
+                          <Truck className="w-8 h-8 text-slate-300 mx-auto mb-2" />
+                          <p>No hay Guías de Remisión emitidas todavía.</p>
+                          <button
+                            onClick={() => {
+                              setDocType('09');
+                              updateDefaultSeries('09');
+                              setActiveTab('emitir');
+                            }}
+                            className="mt-3 text-xs text-indigo-600 hover:text-indigo-800 font-bold underline cursor-pointer"
+                          >
+                            + Emitir la primera Guía de Remisión ahora
+                          </button>
                         </td>
                       </tr>
                     )}
