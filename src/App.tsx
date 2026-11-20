@@ -40,6 +40,7 @@ import { FiscalAuthenticatorModal } from './components/FiscalAuthenticatorModal'
 import { AdminLogin } from './components/AdminLogin';
 import { ConfirmModal } from './components/ConfirmModal';
 import { UsersManagement } from './components/UsersManagement';
+import { SeriesModal } from './components/SeriesModal';
 
 // ============================================================================
 // CONSTANTES GLOBALES Y URL DE API (SOPORTA LOCALHOST Y VERCEL PRODUCTION)
@@ -95,6 +96,9 @@ interface DocumentRecord {
   client_doc_type: string;
   client_doc_number: string;
   client_name: string;
+  client_address?: string;
+  client_email?: string;
+  items?: DocumentItem[];
   total_gravada: string | number;
   total_igv: string | number;
   total_amount: string | number;
@@ -141,6 +145,8 @@ export function App() {
   const [companyToEdit, setCompanyToEdit] = useState<Company | null>(null);
   const [showFiscalModal, setShowFiscalModal] = useState(false);
   const [fiscalAuditCompanyId, setFiscalAuditCompanyId] = useState<string | null>(null);
+  const [showSeriesModal, setShowSeriesModal] = useState(false);
+  const [seriesConfigCompany, setSeriesConfigCompany] = useState<Company | null>(null);
   const [diagnosticDoc, setDiagnosticDoc] = useState<DocumentRecord | null>(null);
 
   // Sistema Centralizado de Confirmación y Alertas Visuales
@@ -210,6 +216,7 @@ export function App() {
   const [refNumber, setRefNumber] = useState<number>(1);
   const [refReasonCode, setRefReasonCode] = useState('01');
   const [refReasonDesc, setRefReasonDesc] = useState('Anulación de la operación');
+  const [selectedRefDocId, setSelectedRefDocId] = useState<string>('');
 
   // 9. Datos del Adquiriente / Cliente
   const [clientDocType, setClientDocType] = useState('6');
@@ -218,6 +225,7 @@ export function App() {
   const [clientAddress, setClientAddress] = useState('Av. República de Panamá 3055, San Isidro, Lima');
   const [clientEmail, setClientEmail] = useState('contacto@andina.com.pe');
   const [lookingUpDoc, setLookingUpDoc] = useState(false);
+  const [clientSunatStatus, setClientSunatStatus] = useState<{ estado: string; condicion: string; ubigeo?: string } | null>(null);
 
   // 10. Consola Sandbox CCOFACT
   const [sandboxLoading, setSandboxLoading] = useState(false);
@@ -312,6 +320,129 @@ export function App() {
     } else if (type === '09') {
       setSeries('T001');
     }
+  };
+
+  // Conmutación sincronizada de Tipo de Comprobante (Factura, Boleta, NC, ND, Guía)
+  const handleDocTypeChange = (newType: '01' | '03' | '07' | '08' | '09') => {
+    setDocType(newType);
+    updateDefaultSeries(newType);
+
+    if (newType === '01') {
+      // Factura exige RUC (6)
+      setClientDocType('6');
+      if (clientDocNumber.length === 8) {
+        setClientDocNumber('');
+        setClientName('');
+        setClientAddress('');
+        setClientSunatStatus(null);
+      }
+    } else if (newType === '03') {
+      // Boleta permite DNI (1) o RUC (6) o Sin Documento (0)
+      if (clientDocType !== '1' && clientDocType !== '0' && clientDocType !== '6') {
+        setClientDocType('1');
+      }
+    } else if (newType === '07') {
+      // Nota de Crédito: sincronizar serie y serie de referencia
+      const s = refDocType === '01' ? 'FC01' : 'BC01';
+      setSeries(s);
+      setRefSeries(refDocType === '01' ? 'F001' : 'B001');
+      if (refDocType === '01') {
+        setClientDocType('6');
+      } else if (clientDocType !== '1' && clientDocType !== '0' && clientDocType !== '6') {
+        setClientDocType('1');
+      }
+      // Auto-seleccionar primer comprobante si no se ha elegido ninguno
+      const eligible = documents.find(d => (d.document_type === '01' || d.document_type === '03') && d.status !== 'ANULADO');
+      if (eligible && !selectedRefDocId) {
+        handleSelectReferenceDoc(eligible.id, '07');
+      }
+    } else if (newType === '08') {
+      // Nota de Débito: sincronizar serie y serie de referencia
+      const s = refDocType === '01' ? 'FD01' : 'BD01';
+      setSeries(s);
+      setRefSeries(refDocType === '01' ? 'F001' : 'B001');
+      if (refDocType === '01') {
+        setClientDocType('6');
+      } else if (clientDocType !== '1' && clientDocType !== '0' && clientDocType !== '6') {
+        setClientDocType('1');
+      }
+      const eligible = documents.find(d => (d.document_type === '01' || d.document_type === '03') && d.status !== 'ANULADO');
+      if (eligible && !selectedRefDocId) {
+        handleSelectReferenceDoc(eligible.id, '08');
+      }
+    } else if (newType === '09') {
+      setSeries('T001');
+    }
+  };
+
+  // Cambio sincronizado del comprobante modificado (Factura vs Boleta) con ajuste estricto de serie y receptor
+  const handleRefDocTypeChange = (newRefType: '01' | '03') => {
+    setRefDocType(newRefType);
+    if (newRefType === '01') {
+      setRefSeries('F001');
+      setClientDocType('6');
+      if (docType === '07') setSeries('FC01');
+      if (docType === '08') setSeries('FD01');
+    } else {
+      setRefSeries('B001');
+      setClientDocType('1');
+      if (docType === '07') setSeries('BC01');
+      if (docType === '08') setSeries('BD01');
+    }
+  };
+
+  // Selección interactiva de comprobante de referencia con autocompletado total
+  const handleSelectReferenceDoc = (docId: string, currentDocType: string = docType) => {
+    setSelectedRefDocId(docId);
+    if (!docId) return;
+
+    const found = documents.find(d => d.id === docId);
+    if (!found) return;
+
+    const refType = (found.document_type === '01' ? '01' : '03') as '01' | '03';
+    setRefDocType(refType);
+    setRefSeries(found.series);
+    setRefNumber(found.number);
+
+    // Sincronizar serie de la Nota de Crédito o Débito
+    if (currentDocType === '07') {
+      setSeries(refType === '01' ? 'FC01' : 'BC01');
+      setRefReasonCode('01');
+      setRefReasonDesc(`Anulación de la operación ${found.full_number}`);
+    } else if (currentDocType === '08') {
+      setSeries(refType === '01' ? 'FD01' : 'BD01');
+      setRefReasonCode('01');
+      setRefReasonDesc(`Intereses por mora de ${found.full_number}`);
+    }
+
+    // Datos del cliente
+    setClientDocType(found.client_doc_type || (refType === '01' ? '6' : '1'));
+    setClientDocNumber(found.client_doc_number || '');
+    setClientName(found.client_name || '');
+    if (found.client_address) setClientAddress(found.client_address);
+    setCurrency((found.currency as any) || 'PEN');
+
+    // Asignar ítem de anulación con el monto exacto del comprobante original
+    setItems([{
+      code: 'ANUL-01',
+      description: `Anulación de la operación de ${found.full_number}`,
+      unit_measure: 'ZZ',
+      quantity: 1,
+      unit_price: Number(found.total_amount),
+      igv_affectation_type: '10'
+    }]);
+
+    setFeedbackAlert({
+      type: 'info',
+      message: `Comprobante ${found.full_number} vinculado. Serie ajustada a ${refType === '01' ? (currentDocType === '07' ? 'FC01' : 'FD01') : (currentDocType === '07' ? 'BC01' : 'BD01')}.`
+    });
+  };
+
+  // Cargar comprobante directamente desde la tabla de documentos para emitir Nota de Crédito
+  const prefillCreditNoteFromDoc = (doc: DocumentRecord) => {
+    setDocType('07');
+    handleSelectReferenceDoc(doc.id, '07');
+    setActiveTab('emitir');
   };
 
   // Enviar JSON de prueba en la consola sandbox de CCOFACT PRO
@@ -431,39 +562,212 @@ export function App() {
     });
   };
 
-  // Consulta RUC / DNI ante SUNAT
-  const handleLookupDoc = async () => {
-    const docNum = clientDocNumber.trim();
-    if (!docNum) return;
+  // Consulta inteligente RUC / DNI ante SUNAT y RENIEC con Auto-Detección
+  const handleLookupDoc = async (customNum?: string, customType?: string) => {
+    const rawInput = (customNum !== undefined ? customNum : clientDocNumber).trim().replace(/\D/g, '');
+    if (!rawInput) {
+      setFeedbackAlert({
+        type: 'error',
+        message: 'Debe ingresar un número de documento para consultar.'
+      });
+      return;
+    }
+
+    let detectedType = customType || clientDocType;
+
+    // Auto-detección inteligente por longitud de caracteres
+    if (rawInput.length === 11) {
+      detectedType = '6';
+      setClientDocType('6');
+    } else if (rawInput.length === 8) {
+      if (docType === '01') {
+        setFeedbackAlert({
+          type: 'error',
+          message: 'ATENCIÓN SUNAT: Factura Electrónica (01) requiere obligatoriamente RUC de 11 dígitos. Un DNI de 8 dígitos solo es válido para Boletas de Venta (03).'
+        });
+        return;
+      }
+      detectedType = '1';
+      setClientDocType('1');
+    }
+
     setLookingUpDoc(true);
     try {
-      if (clientDocType === '6') {
-        const res = await fetch(`${API_BASE}/consultas/ruc/${docNum}`);
+      if (detectedType === '6') {
+        if (rawInput.length !== 11) {
+          throw new Error('El RUC debe tener exactamente 11 dígitos numéricos.');
+        }
+        const res = await fetch(`${API_BASE}/consultas/ruc/${rawInput}`);
         if (!res.ok) {
-          const err = await res.json();
-          throw new Error(err.message || 'RUC no encontrado');
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.message || `RUC ${rawInput} no encontrado en el padrón nacional de SUNAT.`);
         }
         const data = await res.json();
         setClientName(data.razon_social);
         if (data.direccion) setClientAddress(data.direccion);
-      } else if (clientDocType === '1') {
-        const res = await fetch(`${API_BASE}/consultas/dni/${docNum}`);
+        setClientSunatStatus({
+          estado: data.estado || 'ACTIVO',
+          condicion: data.condicion || 'HABIDO',
+          ubigeo: data.ubigeo
+        });
+        setFeedbackAlert({
+          type: 'success',
+          message: `RUC ${rawInput} verificado ante SUNAT: ${data.razon_social} [${data.estado || 'ACTIVO'} / ${data.condicion || 'HABIDO'}]`
+        });
+      } else if (detectedType === '1') {
+        if (rawInput.length !== 8) {
+          throw new Error('El DNI debe tener exactamente 8 dígitos numéricos.');
+        }
+        const res = await fetch(`${API_BASE}/consultas/dni/${rawInput}`);
         if (!res.ok) {
-          const err = await res.json();
-          throw new Error(err.message || 'DNI no encontrado');
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.message || `DNI ${rawInput} no encontrado en RENIEC.`);
         }
         const data = await res.json();
         setClientName(data.nombre_completo);
         if (data.direccion) setClientAddress(data.direccion);
+        setClientSunatStatus(null);
+        setFeedbackAlert({
+          type: 'success',
+          message: `DNI ${rawInput} verificado ante RENIEC: ${data.nombre_completo}`
+        });
       }
     } catch (err: any) {
       setFeedbackAlert({
         type: 'error',
-        message: `Error en consulta SUNAT / RENIEC: ${err.message}`
+        message: err.message
       });
     } finally {
       setLookingUpDoc(false);
     }
+  };
+
+  // Motor de Validación y Diagnóstico Fiscal SUNAT en Tiempo Real
+  const getSunatValidationDiagnostics = () => {
+    const errors: string[] = [];
+    const warnings: string[] = [];
+    const recommendations: string[] = [];
+
+    const cleanDoc = clientDocNumber.trim();
+    const totalsCalc = calculateTotals();
+    const totalMonto = Number(totalsCalc.total);
+
+    // Reglas por tipo de comprobante
+    if (docType === '01') {
+      if (!series.startsWith('F')) {
+        errors.push(`Serie inválida: Para Facturas Electrónicas la serie debe iniciar con 'F' (ej. F001, F002).`);
+      }
+      if (clientDocType !== '6') {
+        errors.push(`Tipo de documento receptor inválido: Factura exige RUC (Tipo 6). No se permite emitir con DNI ni Sin Documento.`);
+      }
+      if (cleanDoc.length !== 11 || !/^\d{11}$/.test(cleanDoc)) {
+        errors.push(`RUC de receptor incompleto: El RUC debe contener exactamente 11 dígitos numéricos.`);
+      }
+      if (!clientName.trim()) {
+        errors.push(`Razón Social del receptor es obligatoria para emisión de Factura.`);
+      }
+    } else if (docType === '03') {
+      if (!series.startsWith('B')) {
+        errors.push(`Serie inválida: Para Boletas de Venta la serie debe iniciar con 'B' (ej. B001, B002).`);
+      }
+      if (totalMonto > 700 && clientDocType === '0') {
+        errors.push(`Bloqueo SUNAT (R.S. 007-99): Boletas con importe mayor a S/ 700.00 requieren identificar obligatoriamente al adquiriente con DNI o RUC.`);
+      }
+      if (clientDocType === '1' && (cleanDoc.length !== 8 || !/^\d{8}$/.test(cleanDoc))) {
+        errors.push(`DNI de receptor inválido: El DNI debe contener exactamente 8 dígitos numéricos.`);
+      }
+      if (clientDocType === '6' && (cleanDoc.length !== 11 || !/^\d{11}$/.test(cleanDoc))) {
+        warnings.push(`Si emite Boleta a un RUC, verifique que el cliente no requiera crédito fiscal (en tal caso debe ser Factura).`);
+      }
+      if (!clientName.trim() && clientDocType !== '0') {
+        errors.push(`El nombre o razón social del cliente es obligatorio.`);
+      }
+    } else if (docType === '07') {
+      const expectedPrefix = refDocType === '01' ? 'FC' : 'BC';
+      if (!series.startsWith(expectedPrefix)) {
+        errors.push(`Serie inválida para Nota de Crédito: Modifica ${refDocType === '01' ? 'Factura' : 'Boleta'}, por tanto su serie debe iniciar con '${expectedPrefix}' (ej. ${expectedPrefix}01).`);
+      }
+      if (!refSeries.trim()) {
+        errors.push(`Serie del comprobante que modifica es obligatoria.`);
+      }
+      if (!refNumber || refNumber <= 0) {
+        errors.push(`Número correlativo del comprobante que modifica es obligatorio.`);
+      }
+      if (!refReasonCode) {
+        errors.push(`Código de motivo de Nota de Crédito (Catálogo 09 SUNAT) es obligatorio.`);
+      }
+    } else if (docType === '08') {
+      const expectedPrefix = refDocType === '01' ? 'FD' : 'BD';
+      if (!series.startsWith(expectedPrefix)) {
+        errors.push(`Serie inválida para Nota de Débito: Modifica ${refDocType === '01' ? 'Factura' : 'Boleta'}, por tanto su serie debe iniciar con '${expectedPrefix}' (ej. ${expectedPrefix}01).`);
+      }
+      if (!refSeries.trim() || !refNumber || refNumber <= 0) {
+        errors.push(`Datos del comprobante modificado son obligatorios.`);
+      }
+    } else if (docType === '09') {
+      if (!series.startsWith('T')) {
+        errors.push(`Serie inválida: Para Guía de Remisión Remitente la serie debe iniciar con 'T' (ej. T001).`);
+      }
+      if (!puntoPartidaDireccion.trim()) {
+        errors.push(`Dirección del punto de partida es obligatoria.`);
+      }
+      if (!puntoPartidaUbigeo || !/^\d{6}$/.test(puntoPartidaUbigeo.trim())) {
+        errors.push(`Ubigeo de partida debe contener 6 dígitos numéricos (ej. 150101).`);
+      }
+      if (!puntoLlegadaDireccion.trim()) {
+        errors.push(`Dirección del punto de llegada es obligatoria.`);
+      }
+      if (!puntoLlegadaUbigeo || !/^\d{6}$/.test(puntoLlegadaUbigeo.trim())) {
+        errors.push(`Ubigeo de llegada debe contener 6 dígitos numéricos (ej. 150101).`);
+      }
+      if (Number(pesoBrutoTotal) <= 0) {
+        errors.push(`El peso bruto total de la carga debe ser mayor a 0 KGM.`);
+      }
+      if (modalidadTraslado === '01') {
+        if (!transportistaDoc.trim() || transportistaDoc.trim().length !== 11) {
+          errors.push(`Transporte Público: RUC de 11 dígitos de la empresa transportista es obligatorio.`);
+        }
+        if (!transportistaNombre.trim()) {
+          errors.push(`Razón social de la empresa transportista es obligatoria.`);
+        }
+      } else {
+        if (!conductorDoc.trim() || conductorDoc.trim().length !== 8) {
+          errors.push(`Transporte Privado: DNI de 8 dígitos del conductor es obligatorio.`);
+        }
+        if (!vehiculoPlaca.trim()) {
+          errors.push(`Placa del vehículo de transporte es obligatoria.`);
+        }
+      }
+    }
+
+    // Reglas de Ítems
+    if (items.length === 0) {
+      errors.push(`Debe ingresar al menos un ítem o producto en el comprobante.`);
+    }
+    items.forEach((it, idx) => {
+      if (!it.description.trim()) {
+        errors.push(`Ítem #${idx + 1}: Descripción vacía.`);
+      }
+      if (Number(it.quantity) <= 0) {
+        errors.push(`Ítem #${idx + 1}: Cantidad debe ser mayor a 0.`);
+      }
+      if (docType !== '09' && Number(it.unit_price) < 0) {
+        errors.push(`Ítem #${idx + 1}: Precio unitario no puede ser negativo.`);
+      }
+    });
+
+    if (currentCompany?.env_mode === 'PRODUCCION') {
+      recommendations.push(`Entorno PRODUCCIÓN: Esta emisión generará afectación legal oficial en SUNAT y en el SIRE.`);
+    } else {
+      recommendations.push(`Entorno BETA: Emisión de prueba en ambiente de homologación SUNAT (sin efecto fiscal).`);
+    }
+
+    return {
+      errors,
+      warnings,
+      recommendations,
+      isValid: errors.length === 0
+    };
   };
 
   // Cálculos matemáticos en tiempo real
@@ -1308,6 +1612,21 @@ export function App() {
             </button>
           )}
 
+          {/* BOTÓN CONFIGURAR SERIES Y CORRELATIVOS SUNAT */}
+          {currentCompany && (
+            <button
+              onClick={() => {
+                setSeriesConfigCompany(currentCompany);
+                setShowSeriesModal(true);
+              }}
+              title="Configurar e inicializar correlativos de emisión para no duplicar en SUNAT"
+              className="flex items-center gap-1.5 bg-white hover:bg-slate-50 text-indigo-700 text-xs px-3 py-2 rounded-xl border border-indigo-200 shadow-2xs font-bold transition cursor-pointer"
+            >
+              <Hash className="w-3.5 h-3.5 text-indigo-600" />
+              <span className="hidden lg:inline">Series & Correlativos</span>
+            </button>
+          )}
+
           {currentCompany && (
             <button
               onClick={() => copyToClipboard(currentCompany.api_key)}
@@ -1794,130 +2113,258 @@ export function App() {
               </label>
             </div>
 
-            <form onSubmit={handleSubmitEmission} className="space-y-6">
-              {/* Selector de Tipo y Serie */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1.5">Tipo de Comprobante</label>
-                  <select
-                    value={docType}
-                    onChange={(e) => {
-                      const t = e.target.value as any;
-                      setDocType(t);
-                      updateDefaultSeries(t);
-                      if (t === '03') {
-                        setClientDocType('1');
-                        setClientDocNumber('48291048');
-                        setClientName('CLIENTE BOLETA EJEMPLO');
-                      } else {
-                        setClientDocType('6');
-                        setClientDocNumber('20601234567');
-                        setClientName('CORPORACION ANDINA DE SERVICIOS S.A.C.');
-                      }
-                    }}
-                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 text-xs text-slate-900 font-bold focus:bg-white focus:border-indigo-600 outline-none transition cursor-pointer"
-                  >
-                    <option value="01">01 - FACTURA ELECTRÓNICA</option>
-                    <option value="03">03 - BOLETA DE VENTA</option>
-                    <option value="07">07 - NOTA DE CRÉDITO</option>
-                    <option value="08">08 - NOTA DE DÉBITO</option>
-                    <option value="09">09 - GUÍA DE REMISIÓN REMITENTE</option>
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1.5">Serie Fiscal</label>
-                  <input
-                    type="text"
-                    value={series}
-                    onChange={(e) => setSeries(e.target.value.toUpperCase())}
-                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 text-xs font-mono font-bold text-slate-900 focus:bg-white focus:border-indigo-600 outline-none transition"
-                    placeholder="F001"
-                    required
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1.5">Moneda</label>
-                  <select
-                    value={currency}
-                    onChange={(e) => setCurrency(e.target.value as any)}
-                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 text-xs text-slate-900 font-bold focus:bg-white focus:border-indigo-600 outline-none transition cursor-pointer"
-                  >
-                    <option value="PEN">SOLES (S/ - PEN)</option>
-                    <option value="USD">DÓLARES ($ - USD)</option>
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1.5">Forma de Pago</label>
-                  <select
-                    value={paymentType}
-                    onChange={(e) => setPaymentType(e.target.value)}
-                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 text-xs text-slate-900 font-bold focus:bg-white focus:border-indigo-600 outline-none transition cursor-pointer"
-                  >
-                    <option value="Contado">Contado</option>
-                    <option value="Credito">Crédito a 30 días</option>
-                  </select>
-                </div>
-              </div>
-
-              {/* SECCIÓN NOTAS DE CRÉDITO Y DÉBITO */}
-              {(docType === '07' || docType === '08') && (
-                <div className="border border-amber-200 bg-amber-50/40 rounded-2xl p-5 space-y-4">
-                  <div className="flex items-center gap-2 text-amber-800 font-bold text-xs uppercase tracking-wider">
-                    <FileText className="w-4 h-4 text-amber-600" />
-                    <span>Datos Obligatorios del Comprobante Modificado ({docType === '07' ? 'Nota de Crédito' : 'Nota de Débito'})</span>
-                  </div>
-
-                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+            {(() => {
+              const diagnostics = getSunatValidationDiagnostics();
+              return (
+                <form onSubmit={handleSubmitEmission} className="space-y-6">
+                  {/* Selector de Tipo y Serie */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
                     <div>
-                      <label className="block text-slate-700 font-semibold mb-1">Tipo de Comprobante Modificado</label>
+                      <label className="block text-xs font-semibold text-slate-700 mb-1.5">Tipo de Comprobante</label>
                       <select
-                        value={refDocType}
-                        onChange={(e) => {
-                          const val = e.target.value as any;
-                          setRefDocType(val);
-                          if (docType === '07') setSeries(val === '01' ? 'FC01' : 'BC01');
-                          if (docType === '08') setSeries(val === '01' ? 'FD01' : 'BD01');
-                        }}
-                        className="w-full bg-white border border-amber-200 rounded-xl px-3 py-2 text-slate-900 font-semibold outline-none"
+                        value={docType}
+                        onChange={(e) => handleDocTypeChange(e.target.value as any)}
+                        className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 text-xs text-slate-900 font-bold focus:bg-white focus:border-indigo-600 outline-none transition cursor-pointer"
                       >
                         <option value="01">01 - FACTURA ELECTRÓNICA</option>
                         <option value="03">03 - BOLETA DE VENTA</option>
+                        <option value="07">07 - NOTA DE CRÉDITO</option>
+                        <option value="08">08 - NOTA DE DÉBITO</option>
+                        <option value="09">09 - GUÍA DE REMISIÓN REMITENTE</option>
                       </select>
                     </div>
 
                     <div>
-                      <label className="block text-slate-700 font-semibold mb-1">Serie Modificada</label>
+                      <div className="flex items-center justify-between mb-1.5">
+                        <label className="block text-xs font-semibold text-slate-700">Serie Fiscal</label>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setSeriesConfigCompany(currentCompany);
+                            setShowSeriesModal(true);
+                          }}
+                          className="text-[11px] text-indigo-600 hover:text-indigo-800 font-bold flex items-center gap-1 cursor-pointer bg-indigo-50/80 px-2 py-0.5 rounded-md border border-indigo-200 hover:bg-indigo-100 transition"
+                          title="Configurar correlativos iniciales y series fiscales para sincronizar con SUNAT"
+                        >
+                          <Hash className="w-3 h-3 text-indigo-600" />
+                          <span>Configurar Correlativo</span>
+                        </button>
+                      </div>
                       <input
                         type="text"
-                        value={refSeries}
-                        onChange={(e) => setRefSeries(e.target.value.toUpperCase())}
-                        className="w-full bg-white border border-amber-200 rounded-xl px-3 py-2 font-mono font-bold text-slate-900 outline-none"
-                        placeholder="F001"
+                        value={series}
+                        onChange={(e) => setSeries(e.target.value.toUpperCase())}
+                        className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 text-xs font-mono font-bold text-slate-900 focus:bg-white focus:border-indigo-600 outline-none transition"
+                        placeholder={docType === '01' ? 'F001' : docType === '03' ? 'B001' : docType === '07' ? (refDocType === '01' ? 'FC01' : 'BC01') : docType === '08' ? (refDocType === '01' ? 'FD01' : 'BD01') : 'T001'}
                         required
                       />
+                      <p className="text-[10px] text-slate-500 mt-1">
+                        {docType === '01' ? 'Facturas: F001 a F999 (RUC obligatorio)' :
+                         docType === '03' ? 'Boletas: B001 a B999 (DNI o consumidor final)' :
+                         docType === '07' ? (refDocType === '01' ? 'Nota Crédito Factura: FC01 a FC99' : 'Nota Crédito Boleta: BC01 a BC99') :
+                         docType === '08' ? (refDocType === '01' ? 'Nota Débito Factura: FD01 a FD99' : 'Nota Débito Boleta: BD01 a BD99') :
+                         'Guía Remitente: T001 a T999'}
+                      </p>
                     </div>
 
                     <div>
-                      <label className="block text-slate-700 font-semibold mb-1">Número Correlativo Modificado</label>
-                      <input
-                        type="number"
-                        min="1"
-                        value={refNumber}
-                        onChange={(e) => setRefNumber(parseInt(e.target.value, 10) || 1)}
-                        className="w-full bg-white border border-amber-200 rounded-xl px-3 py-2 font-mono font-bold text-slate-900 outline-none"
-                        placeholder="1"
-                        required
-                      />
+                      <label className="block text-xs font-semibold text-slate-700 mb-1.5">Moneda</label>
+                      <select
+                        value={currency}
+                        onChange={(e) => setCurrency(e.target.value as any)}
+                        disabled={docType === '09'}
+                        className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 text-xs text-slate-900 font-bold focus:bg-white focus:border-indigo-600 outline-none transition cursor-pointer disabled:opacity-50"
+                      >
+                        <option value="PEN">SOLES (S/ - PEN)</option>
+                        <option value="USD">DÓLARES ($ - USD)</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-700 mb-1.5">Forma de Pago</label>
+                      <select
+                        value={paymentType}
+                        onChange={(e) => setPaymentType(e.target.value)}
+                        disabled={docType === '09'}
+                        className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 text-xs text-slate-900 font-bold focus:bg-white focus:border-indigo-600 outline-none transition cursor-pointer disabled:opacity-50"
+                      >
+                        <option value="Contado">Contado</option>
+                        <option value="Credito">Crédito a 30 días</option>
+                      </select>
                     </div>
                   </div>
 
+                  {/* ASISTENTE TRIBUTARIO Y MONITOR DE REGLAS SUNAT EN VIVO */}
+                  <div className={`p-4 rounded-2xl border transition ${
+                    !diagnostics.isValid
+                      ? 'bg-rose-50/70 border-rose-200 text-rose-900'
+                      : 'bg-emerald-50/70 border-emerald-200 text-emerald-900'
+                  }`}>
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-2.5 border-b border-black/5">
+                      <div className="flex items-center gap-2">
+                        {!diagnostics.isValid ? (
+                          <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+                        ) : (
+                          <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0" />
+                        )}
+                        <span className="font-bold text-xs uppercase tracking-wider">
+                          {!diagnostics.isValid
+                            ? `Validaciones SUNAT Pendientes (${diagnostics.errors.length} requisitos por subsanar)`
+                            : 'Comprobante 100% Conforme con SUNAT UBL 2.1 (Válido para Transmisión Fiscal)'}
+                        </span>
+                      </div>
+                      <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
+                        !diagnostics.isValid
+                          ? 'bg-rose-200 text-rose-800'
+                          : 'bg-emerald-200 text-emerald-800'
+                      }`}>
+                        {currentCompany?.env_mode === 'PRODUCCION' ? 'Validez Legal SIRE' : 'Homologación Beta'}
+                      </span>
+                    </div>
+
+                    {!diagnostics.isValid ? (
+                      <ul className="mt-2 space-y-1 text-xs text-rose-800">
+                        {diagnostics.errors.map((err, idx) => (
+                          <li key={idx} className="flex items-start gap-1.5 font-medium">
+                            <span className="text-rose-500 font-bold">•</span>
+                            <span>{err}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <div className="mt-2 flex flex-wrap gap-2 text-[11px]">
+                        <span className="bg-white/90 text-emerald-800 px-2.5 py-1 rounded-lg border border-emerald-200 font-semibold flex items-center gap-1">
+                          <Check className="w-3 h-3 text-emerald-600" /> Serie: {series}
+                        </span>
+                        <span className="bg-white/90 text-emerald-800 px-2.5 py-1 rounded-lg border border-emerald-200 font-semibold flex items-center gap-1">
+                          <Check className="w-3 h-3 text-emerald-600" /> Receptor: {clientDocType === '6' ? 'RUC' : clientDocType === '1' ? 'DNI' : 'Doc'} {clientDocNumber}
+                        </span>
+                        {clientSunatStatus && (
+                          <span className="bg-emerald-100 text-emerald-900 px-2.5 py-1 rounded-lg font-bold flex items-center gap-1 border border-emerald-300">
+                            <Award className="w-3 h-3 text-emerald-600" /> SUNAT: {clientSunatStatus.estado} - {clientSunatStatus.condicion}
+                          </span>
+                        )}
+                        <span className="bg-white/90 text-emerald-800 px-2.5 py-1 rounded-lg border border-emerald-200 font-semibold flex items-center gap-1">
+                          <Check className="w-3 h-3 text-emerald-600" /> Certificado X.509 Listo
+                        </span>
+                      </div>
+                    )}
+
+                    {diagnostics.warnings.length > 0 && (
+                      <div className="mt-2 pt-2 border-t border-black/5 text-xs text-amber-800 space-y-1">
+                        {diagnostics.warnings.map((w, idx) => (
+                          <div key={idx} className="flex items-center gap-1.5">
+                            <Info className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                            <span>{w}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* SECCIÓN NOTAS DE CRÉDITO Y DÉBITO */}
+                  {(docType === '07' || docType === '08') && (
+                    <div className="border border-amber-200 bg-amber-50/40 rounded-2xl p-5 space-y-4">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2 text-amber-800 font-bold text-xs uppercase tracking-wider">
+                          <FileText className="w-4 h-4 text-amber-600" />
+                          <span>Datos Obligatorios del Comprobante Modificado ({docType === '07' ? 'Nota de Crédito' : 'Nota de Débito'})</span>
+                        </div>
+                        <span className="text-[10px] bg-amber-100 text-amber-800 font-bold px-2 py-0.5 rounded-full border border-amber-300">
+                          Catálogo {docType === '07' ? '09 NC' : '10 ND'} SUNAT
+                        </span>
+                      </div>
+
+                      {/* Selector Inteligente de Comprobante Emitido */}
+                      <div className="bg-white p-3.5 rounded-xl border border-amber-200 shadow-2xs space-y-1.5">
+                        <div className="flex items-center justify-between">
+                          <label className="block text-slate-800 font-bold text-xs">
+                            Selecciona un comprobante emitido para autocompletar todo automáticamente:
+                          </label>
+                          <span className="text-[10px] text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded-full font-bold border border-indigo-200">
+                            {documents.filter(d => (d.document_type === '01' || d.document_type === '03') && d.status !== 'ANULADO').length} disponibles
+                          </span>
+                        </div>
+                        <select
+                          value={selectedRefDocId}
+                          onChange={(e) => handleSelectReferenceDoc(e.target.value)}
+                          className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-bold text-slate-900 outline-none cursor-pointer focus:bg-white focus:border-amber-500"
+                        >
+                          <option value="">-- Ingreso Manual o Selecciona de la lista --</option>
+                          {documents
+                            .filter(d => (d.document_type === '01' || d.document_type === '03') && d.status !== 'ANULADO')
+                            .map(d => (
+                              <option key={d.id} value={d.id}>
+                                {d.full_number} ({d.document_type === '01' ? 'Factura' : 'Boleta'}) - {d.client_name} - {d.currency === 'USD' ? '$' : 'S/'} {Number(d.total_amount).toFixed(2)} [{d.status}]
+                              </option>
+                            ))}
+                        </select>
+                        {selectedRefDocId && (
+                          <p className="text-[11px] text-emerald-700 font-semibold flex items-center gap-1 pt-0.5">
+                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                            Comprobante vinculado. Serie ajustada automáticamente y datos del cliente precargados.
+                          </p>
+                        )}
+                      </div>
+
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+                        <div>
+                          <label className="block text-slate-800 font-bold mb-1">
+                            Tipo de Comprobante Afectado *
+                          </label>
+                          <select
+                            value={refDocType}
+                            onChange={(e) => handleRefDocTypeChange(e.target.value as any)}
+                            className="w-full bg-white border border-amber-300 rounded-xl px-3 py-2 text-slate-900 font-bold outline-none focus:ring-2 focus:ring-amber-400"
+                          >
+                            <option value="01">01 - FACTURA ELECTRÓNICA</option>
+                            <option value="03">03 - BOLETA DE VENTA</option>
+                          </select>
+                          <p className="text-[10px] text-amber-800 mt-1">
+                            {refDocType === '01' ? 'Afecta a Factura (exige RUC)' : 'Afecta a Boleta (DNI o Consumidor)'}
+                          </p>
+                        </div>
+
+                        <div>
+                          <label className="block text-slate-800 font-bold mb-1">
+                            Serie Original en SUNAT *
+                          </label>
+                          <input
+                            type="text"
+                            value={refSeries}
+                            onChange={(e) => setRefSeries(e.target.value.toUpperCase())}
+                            className="w-full bg-white border border-amber-300 rounded-xl px-3 py-2 font-mono font-bold text-slate-900 outline-none focus:ring-2 focus:ring-amber-400"
+                            placeholder={refDocType === '01' ? 'F001' : 'B001'}
+                            required
+                          />
+                          <p className="text-[10px] text-amber-800 mt-1">
+                            {refDocType === '01' ? 'Serie de Factura (inicia con F)' : 'Serie de Boleta (inicia con B)'}
+                          </p>
+                        </div>
+
+                        <div>
+                          <label className="block text-slate-800 font-bold mb-1">
+                            Número Correlativo Original *
+                          </label>
+                          <input
+                            type="number"
+                            min="1"
+                            value={refNumber}
+                            onChange={(e) => setRefNumber(parseInt(e.target.value, 10) || 1)}
+                            className="w-full bg-white border border-amber-300 rounded-xl px-3 py-2 font-mono font-bold text-slate-900 outline-none focus:ring-2 focus:ring-amber-400"
+                            placeholder="Ej: 21"
+                            required
+                          />
+                          <p className="text-[10px] text-amber-800 mt-1">
+                            Correlativo exacto declarado (ej. si fue {refSeries}-21, escribe 21)
+                          </p>
+                        </div>
+                      </div>
+
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
                     <div>
-                      <label className="block text-slate-700 font-semibold mb-1">
-                        Código de Motivo SUNAT ({docType === '07' ? 'Catálogo 09 NC' : 'Catálogo 10 ND'})
+                      <label className="block text-slate-800 font-bold mb-1">
+                        Código de Motivo SUNAT ({docType === '07' ? 'Catálogo 09 NC' : 'Catálogo 10 ND'}) *
                       </label>
                       {docType === '07' ? (
                         <select
@@ -1937,7 +2384,7 @@ export function App() {
                             };
                             if (mapDescs[e.target.value]) setRefReasonDesc(mapDescs[e.target.value]);
                           }}
-                          className="w-full bg-white border border-amber-200 rounded-xl px-3 py-2 text-slate-900 font-semibold outline-none"
+                          className="w-full bg-white border border-amber-300 rounded-xl px-3 py-2 text-slate-900 font-semibold outline-none focus:ring-2 focus:ring-amber-400"
                         >
                           <option value="01">01 - Anulación de la operación</option>
                           <option value="02">02 - Anulación por error en el RUC</option>
@@ -1961,25 +2408,33 @@ export function App() {
                             };
                             if (mapDescs[e.target.value]) setRefReasonDesc(mapDescs[e.target.value]);
                           }}
-                          className="w-full bg-white border border-amber-200 rounded-xl px-3 py-2 text-slate-900 font-semibold outline-none"
+                          className="w-full bg-white border border-amber-300 rounded-xl px-3 py-2 text-slate-900 font-semibold outline-none focus:ring-2 focus:ring-amber-400"
                         >
                           <option value="01">01 - Intereses por mora</option>
                           <option value="02">02 - Aumento en el valor</option>
                           <option value="03">03 - Penalidades / otros conceptos</option>
                         </select>
                       )}
+                      <p className="text-[10px] text-amber-800 mt-1">
+                        Causa tributaria formal estandarizada por SUNAT
+                      </p>
                     </div>
 
                     <div>
-                      <label className="block text-slate-700 font-semibold mb-1">Descripción / Sustento del Motivo</label>
+                      <label className="block text-slate-800 font-bold mb-1">
+                        Sustento Detallado del Motivo (Aparece en XML y PDF) *
+                      </label>
                       <input
                         type="text"
                         value={refReasonDesc}
                         onChange={(e) => setRefReasonDesc(e.target.value)}
-                        className="w-full bg-white border border-amber-200 rounded-xl px-3 py-2 text-slate-900 outline-none"
-                        placeholder="Sustento tributario del comprobante"
+                        className="w-full bg-white border border-amber-300 rounded-xl px-3 py-2 text-slate-900 outline-none focus:ring-2 focus:ring-amber-400"
+                        placeholder="Ej: Anulación de la venta por devolución de mercadería"
                         required
                       />
+                      <p className="text-[10px] text-amber-800 mt-1">
+                        Descripción legible que se transmitirá a SUNAT y al cliente
+                      </p>
                     </div>
                   </div>
                 </div>
@@ -2282,13 +2737,13 @@ export function App() {
                       <label className="font-semibold text-slate-700">Número de Documento</label>
                       <button
                         type="button"
-                        onClick={handleLookupDoc}
+                        onClick={() => handleLookupDoc()}
                         disabled={lookingUpDoc}
                         className="text-[11px] text-indigo-600 hover:text-indigo-800 font-bold flex items-center gap-1 cursor-pointer"
                         title="Consultar y autocompletar razón social"
                       >
                         {lookingUpDoc ? <RotateCw className="w-3 h-3 animate-spin" /> : <Search className="w-3 h-3" />}
-                        <span>Consultar SUNAT</span>
+                        <span>Consultar SUNAT / RENIEC</span>
                       </button>
                     </div>
                     <input
@@ -2304,24 +2759,45 @@ export function App() {
                       onChange={(e) => {
                         const val = e.target.value.replace(/\D/g, '');
                         setClientDocNumber(val);
-                        if ((clientDocType === '6' && val.length === 11) || (clientDocType === '1' && val.length === 8)) {
-                          handleLookupDoc();
+                        if (val.length === 11) {
+                          if (clientDocType !== '6') {
+                            setClientDocType('6');
+                          }
+                          handleLookupDoc(val, '6');
+                        } else if (val.length === 8) {
+                          if (docType !== '01') {
+                            if (clientDocType !== '1') {
+                              setClientDocType('1');
+                            }
+                            handleLookupDoc(val, '1');
+                          }
                         }
                       }}
-                      placeholder="Ingresa DNI (8) o RUC (11) y presiona Enter"
+                      placeholder={clientDocType === '6' ? "Ingresa RUC (11 dígitos)" : clientDocType === '1' ? "Ingresa DNI (8 dígitos)" : "Número de documento"}
                       className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 font-mono text-sm text-slate-900 outline-none focus:border-indigo-600 focus:ring-2 focus:ring-indigo-100 transition"
-                      required
+                      required={clientDocType !== '0'}
                     />
                   </div>
 
                   <div>
-                    <label className="block font-semibold text-slate-700 mb-1">Razón Social / Nombre Completo</label>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="font-semibold text-slate-700">Razón Social / Nombre Completo</label>
+                      {clientSunatStatus && (
+                        <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${
+                          clientSunatStatus.estado === 'ACTIVO' && clientSunatStatus.condicion === 'HABIDO'
+                            ? 'bg-emerald-50 text-emerald-700 border-emerald-300'
+                            : 'bg-amber-50 text-amber-700 border-amber-300'
+                        }`}>
+                          SUNAT: {clientSunatStatus.estado} - {clientSunatStatus.condicion}
+                        </span>
+                      )}
+                    </div>
                     <input
                       type="text"
                       value={clientName}
                       onChange={(e) => setClientName(e.target.value)}
                       className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 text-sm text-slate-900 outline-none"
-                      required
+                      required={clientDocType !== '0'}
                     />
                   </div>
                 </div>
@@ -2453,20 +2929,36 @@ export function App() {
                 </div>
               </div>
 
-              {/* Botón de Emisión */}
-              <div className="flex justify-end gap-3 pt-2">
+              {/* Botón de Emisión con Control Estricto */}
+              <div className="flex flex-col sm:flex-row items-end sm:items-center justify-between gap-3 pt-2">
+                <div className="text-xs">
+                  {!diagnostics.isValid ? (
+                    <span className="text-rose-700 font-bold flex items-center gap-1.5">
+                      <AlertCircle className="w-4 h-4 text-rose-600" />
+                      Hay {diagnostics.errors.length} observaciones pendientes de cumplir según normativa SUNAT.
+                    </span>
+                  ) : (
+                    <span className="text-emerald-700 font-bold flex items-center gap-1.5">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                      Comprobante validado y listo para generar XML UBL 2.1 firmado.
+                    </span>
+                  )}
+                </div>
+
                 <button
                   type="submit"
-                  disabled={loading}
-                  className="flex items-center gap-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 disabled:opacity-50 text-white font-bold text-sm px-6 py-3.5 rounded-xl shadow-lg shadow-indigo-500/25 transition cursor-pointer"
+                  disabled={loading || !diagnostics.isValid}
+                  className="flex items-center gap-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold text-sm px-6 py-3.5 rounded-xl shadow-lg shadow-indigo-500/25 transition cursor-pointer"
                 >
                   {loading ? <RotateCw className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
                   <span>{loading ? 'Firmando y Transmitiendo...' : 'Firmar y Emitir Comprobante a SUNAT'}</span>
                 </button>
               </div>
             </form>
-          </div>
-        )}
+          );
+        })()}
+      </div>
+    )}
 
         {/* ================================================================== */}
         {/* TAB 3: COMPROBANTES EMITIDOS */}
@@ -2591,11 +3083,21 @@ export function App() {
                               </button>
                             )}
 
+                            {doc.status.includes('ACCEPTED') && doc.status !== 'ANULADO' && (doc.document_type === '01' || doc.document_type === '03') && (
+                              <button
+                                onClick={() => prefillCreditNoteFromDoc(doc)}
+                                className="p-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-lg transition cursor-pointer"
+                                title="Emitir Nota de Crédito personalizada para este comprobante"
+                              >
+                                <FileText className="w-3.5 h-3.5" />
+                              </button>
+                            )}
+
                             {doc.status.includes('ACCEPTED') && doc.status !== 'ANULADO' && (
                               <button
                                 onClick={() => handleAnularDocument(doc)}
                                 className="p-1.5 bg-amber-50 hover:bg-amber-100 text-amber-700 rounded-lg transition cursor-pointer"
-                                title="Anular según Ley SUNAT (Emite Nota de Crédito Oficial Motivo 01)"
+                                title="Anulación Formal Directa ante SUNAT (Emite Nota de Crédito Motivo 01)"
                               >
                                 <Ban className="w-3.5 h-3.5" />
                               </button>
@@ -3007,6 +3509,18 @@ export function App() {
                     >
                       <Zap className="w-3.5 h-3.5 text-amber-500" />
                       <span>Variables Control Finanzas</span>
+                    </button>
+
+                    <button
+                      onClick={() => {
+                        setSeriesConfigCompany(comp);
+                        setShowSeriesModal(true);
+                      }}
+                      className="flex items-center gap-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 text-xs px-3 py-1.5 rounded-xl font-bold transition cursor-pointer"
+                      title="Configurar series fiscales y correlativos iniciales para evitar duplicados en SUNAT"
+                    >
+                      <Hash className="w-3.5 h-3.5 text-indigo-600" />
+                      <span>Series & Correlativos</span>
                     </button>
 
                     <button
@@ -3518,6 +4032,21 @@ Idempotency-Key: cco_order_987654 (Opcional pero recomendado para cero duplicado
         onCompanyUpdated={async (updated) => {
           setIntegrationCompany(updated);
           setCurrentCompany(updated);
+          await fetchCompanies();
+        }}
+      />
+
+      {/* MODAL 1.5: CONFIGURACIÓN E INICIALIZACIÓN DE SERIES Y CORRELATIVOS SUNAT */}
+      <SeriesModal
+        isOpen={showSeriesModal}
+        onClose={() => {
+          setShowSeriesModal(false);
+          setSeriesConfigCompany(null);
+        }}
+        company={seriesConfigCompany || currentCompany}
+        apiBase={API_BASE}
+        onSaved={async () => {
+          await fetchDocuments();
           await fetchCompanies();
         }}
       />
