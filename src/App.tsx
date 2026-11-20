@@ -33,6 +33,8 @@ import {
   BarChart3,
   Truck,
   MapPin,
+  Sparkles,
+  Leaf,
 } from 'lucide-react';
 import { IntegrationModal } from './components/IntegrationModal';
 import { CompanyFormModal } from './components/CompanyFormModal';
@@ -100,6 +102,9 @@ interface DocumentRecord {
   client_email?: string;
   items?: DocumentItem[];
   total_gravada: string | number;
+  total_exonerada?: string | number;
+  total_inafecta?: string | number;
+  total_gratuita?: string | number;
   total_igv: string | number;
   total_amount: string | number;
   status: string;
@@ -422,19 +427,30 @@ export function App() {
     if (found.client_address) setClientAddress(found.client_address);
     setCurrency((found.currency as any) || 'PEN');
 
-    // Asignar ítem de anulación con el monto exacto del comprobante original
+    // Detectar afectación tributaria real del comprobante de origen
+    const refExonerada = Number(found.total_exonerada || 0);
+    const refInafecta = Number(found.total_inafecta || 0);
+    const refIgv = Number(found.total_igv || 0);
+    let originalAffectation = '10';
+    if (refExonerada > 0 && refIgv === 0) {
+      originalAffectation = '20';
+    } else if (refInafecta > 0 && refIgv === 0) {
+      originalAffectation = '30';
+    }
+
+    // Asignar ítem de anulación con el monto exacto del comprobante original y su régimen de IGV
     setItems([{
       code: 'ANUL-01',
       description: `Anulación de la operación de ${found.full_number}`,
       unit_measure: 'ZZ',
       quantity: 1,
       unit_price: Number(found.total_amount),
-      igv_affectation_type: '10'
+      igv_affectation_type: originalAffectation
     }]);
 
     setFeedbackAlert({
       type: 'info',
-      message: `Comprobante ${found.full_number} vinculado. Serie ajustada a ${refType === '01' ? (currentDocType === '07' ? 'FC01' : 'FD01') : (currentDocType === '07' ? 'BC01' : 'BD01')}.`
+      message: `Comprobante ${found.full_number} vinculado (${originalAffectation === '20' ? 'Exonerado 0% IGV' : originalAffectation === '30' ? 'Inafecto 0% IGV' : 'Gravado 18% IGV'}). Serie ajustada a ${refType === '01' ? (currentDocType === '07' ? 'FC01' : 'FD01') : (currentDocType === '07' ? 'BC01' : 'BD01')}.`
     });
   };
 
@@ -770,28 +786,71 @@ export function App() {
     };
   };
 
-  // Cálculos matemáticos en tiempo real
+  // Cálculos matemáticos en tiempo real conforme a la normativa SUNAT UBL 2.1 (Catálogo 07)
   const calculateTotals = () => {
-    let subtotal = 0;
+    let gravada = 0;
+    let exonerada = 0;
+    let inafecta = 0;
+    let gratuita = 0;
     let igv = 0;
     let total = 0;
 
     items.forEach(it => {
-      const itemSubtotal = (Number(it.quantity) * Number(it.unit_price)) / 1.18;
-      const itemIgv = itemSubtotal * 0.18;
-      subtotal += itemSubtotal;
-      igv += itemIgv;
-      total += Number(it.quantity) * Number(it.unit_price);
+      const qty = Number(it.quantity) || 0;
+      const price = Number(it.unit_price) || 0;
+      const lineTotal = Number((qty * price).toFixed(2));
+      const aff = it.igv_affectation_type || '10';
+
+      if (aff === '10') {
+        // Gravado - 18% IGV (Precio unitario incluye IGV según norma de ventas al consumidor)
+        const base = Number((lineTotal / 1.18).toFixed(2));
+        const lineIgv = Number((lineTotal - base).toFixed(2));
+        gravada += base;
+        igv += lineIgv;
+        total += lineTotal;
+      } else if (aff === '20') {
+        // Exonerado - 0% IGV (Ley de Amazonía N° 27037 / Apéndice I y II Ley del IGV)
+        exonerada += lineTotal;
+        total += lineTotal;
+      } else if (aff === '30' || aff === '40') {
+        // Inafecto / Exportación - 0% IGV
+        inafecta += lineTotal;
+        total += lineTotal;
+      } else {
+        // Transferencias a título gratuito: no se cobra al cliente en el total a pagar
+        gratuita += lineTotal;
+      }
     });
 
     return {
-      subtotal: subtotal.toFixed(2),
+      gravada: gravada.toFixed(2),
+      exonerada: exonerada.toFixed(2),
+      inafecta: inafecta.toFixed(2),
+      gratuita: gratuita.toFixed(2),
+      subtotal: (gravada + exonerada + inafecta).toFixed(2),
       igv: igv.toFixed(2),
-      total: total.toFixed(2)
+      total: total.toFixed(2),
+      hasGravada: gravada > 0,
+      hasExonerada: exonerada > 0,
+      hasInafecta: inafecta > 0,
+      hasGratuita: gratuita > 0,
     };
   };
 
+  // Aplicar afectación global a todas las líneas del comprobante
+  const handleApplyGlobalAffectation = (affType: string) => {
+    setItems(items.map(it => ({
+      ...it,
+      igv_affectation_type: affType
+    })));
+    setFeedbackAlert({
+      type: 'info',
+      message: `Régimen actualizado a ${affType === '20' ? 'Exonerado (0% IGV - Ley Amazonía / Apéndice)' : affType === '30' ? 'Inafecto (0% IGV)' : 'Gravado (18% IGV)'} para todos los ítems.`
+    });
+  };
+
   const handleAddItem = () => {
+    const lastAff = items.length > 0 ? items[items.length - 1].igv_affectation_type : '10';
     setItems([
       ...items,
       {
@@ -800,7 +859,7 @@ export function App() {
         unit_measure: 'NIU',
         quantity: 1,
         unit_price: 10.00,
-        igv_affectation_type: '10'
+        igv_affectation_type: lastAff
       }
     ]);
   };
@@ -2239,6 +2298,21 @@ export function App() {
                         <span className="bg-white/90 text-emerald-800 px-2.5 py-1 rounded-lg border border-emerald-200 font-semibold flex items-center gap-1">
                           <Check className="w-3 h-3 text-emerald-600" /> Receptor: {clientDocType === '6' ? 'RUC' : clientDocType === '1' ? 'DNI' : 'Doc'} {clientDocNumber}
                         </span>
+                        {totals.hasExonerada && (
+                          <span className="bg-emerald-100 text-emerald-900 px-2.5 py-1 rounded-lg font-bold flex items-center gap-1 border border-emerald-300">
+                            <Leaf className="w-3 h-3 text-emerald-600" /> Régimen: Exonerado 0% IGV (Ley Amazonía)
+                          </span>
+                        )}
+                        {totals.hasInafecta && (
+                          <span className="bg-purple-100 text-purple-900 px-2.5 py-1 rounded-lg font-bold flex items-center gap-1 border border-purple-300">
+                            <FileText className="w-3 h-3 text-purple-600" /> Régimen: Inafecto 0% IGV
+                          </span>
+                        )}
+                        {totals.hasGravada && (
+                          <span className="bg-white/90 text-indigo-900 px-2.5 py-1 rounded-lg border border-indigo-200 font-semibold flex items-center gap-1">
+                            <Check className="w-3 h-3 text-indigo-600" /> IGV 18%: {currency === 'USD' ? '$' : 'S/'} {totals.igv}
+                          </span>
+                        )}
                         {clientSunatStatus && (
                           <span className="bg-emerald-100 text-emerald-900 px-2.5 py-1 rounded-lg font-bold flex items-center gap-1 border border-emerald-300">
                             <Award className="w-3 h-3 text-emerald-600" /> SUNAT: {clientSunatStatus.estado} - {clientSunatStatus.condicion}
@@ -2826,8 +2900,17 @@ export function App() {
 
               {/* Items del Comprobante */}
               <div className="border border-slate-200 rounded-2xl p-4 bg-slate-50/50 space-y-4">
-                <div className="flex items-center justify-between">
-                  <h4 className="text-xs font-bold text-slate-700 uppercase tracking-wider">Ítems / Servicios a Facturar</h4>
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wider">
+                      Líneas de Detalle / Productos o Servicios
+                    </h4>
+                    {totals.hasExonerada && (
+                      <span className="text-[10px] bg-emerald-100 text-emerald-800 font-bold px-2 py-0.5 rounded-full border border-emerald-300 flex items-center gap-1">
+                        <Leaf className="w-3 h-3 text-emerald-600" /> Exonerado (0% IGV Activo)
+                      </span>
+                    )}
+                  </div>
                   <button
                     type="button"
                     onClick={handleAddItem}
@@ -2837,89 +2920,189 @@ export function App() {
                   </button>
                 </div>
 
+                {/* SELECTOR RÁPIDO DE RÉGIMEN TRIBUTARIO GLOBAL */}
+                <div className="bg-white border border-slate-200 rounded-xl p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                  <div className="flex items-center gap-2">
+                    <Sparkles className="w-4 h-4 text-indigo-600 shrink-0" />
+                    <div>
+                      <span className="text-xs font-bold text-slate-800 block">
+                        Régimen de IGV Rápido para el comprobante:
+                      </span>
+                      <span className="text-[10px] text-slate-500">
+                        Cambia la tasa de IGV de todas las líneas en un solo clic
+                      </span>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <button
+                      type="button"
+                      onClick={() => handleApplyGlobalAffectation('10')}
+                      className="px-2.5 py-1 rounded-lg border text-xs font-bold bg-slate-50 hover:bg-indigo-50 text-slate-700 hover:text-indigo-700 border-slate-200 transition cursor-pointer"
+                    >
+                      💼 Gravado (18%)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleApplyGlobalAffectation('20')}
+                      className="px-2.5 py-1 rounded-lg border text-xs font-bold bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border-emerald-300 transition cursor-pointer flex items-center gap-1"
+                    >
+                      <Leaf className="w-3 h-3 text-emerald-600" /> Exonerado (0% Amazonía)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleApplyGlobalAffectation('30')}
+                      className="px-2.5 py-1 rounded-lg border text-xs font-bold bg-purple-50 hover:bg-purple-100 text-purple-800 border-purple-300 transition cursor-pointer"
+                    >
+                      📄 Inafecto (0%)
+                    </button>
+                  </div>
+                </div>
+
                 <div className="space-y-3">
                   {items.map((it, idx) => (
-                    <div key={idx} className="grid grid-cols-12 gap-3 items-center bg-white p-3 rounded-xl border border-slate-200 shadow-2xs">
-                      <div className="col-span-2">
-                        <label className="block text-[10px] text-slate-500 mb-1 font-semibold">Código</label>
-                        <input
-                          type="text"
-                          value={it.code}
-                          onChange={(e) => handleItemChange(idx, 'code', e.target.value)}
-                          className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-slate-900"
-                          placeholder="COD-01"
-                        />
+                    <div key={idx} className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-2xs space-y-2">
+                      <div className="grid grid-cols-12 gap-3 items-center">
+                        <div className="col-span-2">
+                          <label className="block text-[10px] text-slate-500 mb-1 font-semibold">Código</label>
+                          <input
+                            type="text"
+                            value={it.code}
+                            onChange={(e) => handleItemChange(idx, 'code', e.target.value)}
+                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-slate-900"
+                            placeholder="COD-01"
+                          />
+                        </div>
+                        <div className="col-span-4">
+                          <label className="block text-[10px] text-slate-500 mb-1 font-semibold">Descripción del Ítem</label>
+                          <input
+                            type="text"
+                            value={it.description}
+                            onChange={(e) => handleItemChange(idx, 'description', e.target.value)}
+                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-slate-900"
+                            placeholder="Descripción del bien o servicio"
+                            required
+                          />
+                        </div>
+                        <div className="col-span-1">
+                          <label className="block text-[10px] text-slate-500 mb-1 font-semibold">Cant.</label>
+                          <input
+                            type="number"
+                            step="1"
+                            min="1"
+                            value={it.quantity}
+                            onChange={(e) => handleItemChange(idx, 'quantity', e.target.value)}
+                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2 py-1.5 text-xs text-right text-slate-900 font-bold"
+                            required
+                          />
+                        </div>
+                        <div className="col-span-2">
+                          <label className="block text-[10px] text-slate-500 mb-1 font-semibold">
+                            {it.igv_affectation_type === '20'
+                              ? 'Precio (Exonerado 0%)'
+                              : it.igv_affectation_type === '30'
+                              ? 'Precio (Inafecto 0%)'
+                              : 'Precio (Inc. 18% IGV)'}
+                          </label>
+                          <input
+                            type="number"
+                            step="0.01"
+                            value={it.unit_price}
+                            onChange={(e) => handleItemChange(idx, 'unit_price', e.target.value)}
+                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-right text-slate-900 font-mono font-bold"
+                            required
+                          />
+                        </div>
+                        <div className="col-span-2">
+                          <label className="block text-[10px] text-slate-500 mb-1 font-semibold">Afectación IGV SUNAT</label>
+                          <select
+                            value={it.igv_affectation_type}
+                            onChange={(e) => handleItemChange(idx, 'igv_affectation_type', e.target.value)}
+                            className={`w-full border rounded-lg px-2 py-1.5 text-xs font-bold outline-none cursor-pointer ${
+                              it.igv_affectation_type === '20'
+                                ? 'bg-emerald-50 text-emerald-800 border-emerald-300'
+                                : it.igv_affectation_type === '30'
+                                ? 'bg-purple-50 text-purple-800 border-purple-300'
+                                : 'bg-slate-50 text-slate-800 border-slate-200'
+                            }`}
+                          >
+                            <option value="10">10 - Gravado (18%)</option>
+                            <option value="20">20 - Exonerado (0%)</option>
+                            <option value="30">30 - Inafecto (0%)</option>
+                            <option value="40">40 - Exportación (0%)</option>
+                          </select>
+                        </div>
+                        <div className="col-span-1 flex justify-end pt-4">
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveItem(idx)}
+                            className="p-1.5 text-slate-400 hover:text-rose-600 rounded-lg transition cursor-pointer"
+                            title="Eliminar fila"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
                       </div>
-                      <div className="col-span-4">
-                        <label className="block text-[10px] text-slate-500 mb-1 font-semibold">Descripción</label>
-                        <input
-                          type="text"
-                          value={it.description}
-                          onChange={(e) => handleItemChange(idx, 'description', e.target.value)}
-                          className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-slate-900"
-                          placeholder="Descripción del bien o servicio"
-                          required
-                        />
-                      </div>
-                      <div className="col-span-1">
-                        <label className="block text-[10px] text-slate-500 mb-1 font-semibold">Cant.</label>
-                        <input
-                          type="number"
-                          step="1"
-                          min="1"
-                          value={it.quantity}
-                          onChange={(e) => handleItemChange(idx, 'quantity', e.target.value)}
-                          className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2 py-1.5 text-xs text-right text-slate-900 font-bold"
-                          required
-                        />
-                      </div>
-                      <div className="col-span-2">
-                        <label className="block text-[10px] text-slate-500 mb-1 font-semibold">Precio (Con IGV)</label>
-                        <input
-                          type="number"
-                          step="0.01"
-                          value={it.unit_price}
-                          onChange={(e) => handleItemChange(idx, 'unit_price', e.target.value)}
-                          className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-right text-slate-900 font-mono font-bold"
-                          required
-                        />
-                      </div>
-                      <div className="col-span-2">
-                        <label className="block text-[10px] text-slate-500 mb-1 font-semibold">Afectación IGV</label>
-                        <select
-                          value={it.igv_affectation_type}
-                          onChange={(e) => handleItemChange(idx, 'igv_affectation_type', e.target.value)}
-                          className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2 py-1.5 text-xs text-slate-800 font-medium"
-                        >
-                          <option value="10">10 - Gravado (18%)</option>
-                          <option value="20">20 - Exonerado</option>
-                          <option value="30">30 - Inafecto</option>
-                        </select>
-                      </div>
-                      <div className="col-span-1 flex justify-end pt-4">
-                        <button
-                          type="button"
-                          onClick={() => handleRemoveItem(idx)}
-                          className="p-1.5 text-slate-400 hover:text-rose-600 rounded-lg transition cursor-pointer"
-                          title="Eliminar fila"
-                        >
-                          <Trash2 className="w-4 h-4" />
-                        </button>
+
+                      {/* Desglose dinámico en vivo por ítem */}
+                      <div className="flex items-center justify-between text-[11px] pt-1.5 border-t border-slate-100">
+                        <div>
+                          {it.igv_affectation_type === '20' ? (
+                            <span className="text-emerald-700 font-bold flex items-center gap-1">
+                              <Leaf className="w-3 h-3 text-emerald-600" />
+                              Operación Exonerada: Tasa 0.00% IGV • Base: {currency === 'USD' ? '$' : 'S/'} {(Number(it.quantity) * Number(it.unit_price)).toFixed(2)}
+                            </span>
+                          ) : it.igv_affectation_type === '30' ? (
+                            <span className="text-purple-700 font-bold flex items-center gap-1">
+                              Operación Inafecta: Tasa 0.00% IGV • Base: {currency === 'USD' ? '$' : 'S/'} {(Number(it.quantity) * Number(it.unit_price)).toFixed(2)}
+                            </span>
+                          ) : (
+                            <span className="text-slate-600 font-medium">
+                              Base Imponible: <span className="font-mono font-bold text-slate-800">{currency === 'USD' ? '$' : 'S/'} {((Number(it.quantity) * Number(it.unit_price)) / 1.18).toFixed(2)}</span> • IGV (18%): <span className="font-mono font-bold text-indigo-700">{currency === 'USD' ? '$' : 'S/'} {((Number(it.quantity) * Number(it.unit_price)) - ((Number(it.quantity) * Number(it.unit_price)) / 1.18)).toFixed(2)}</span>
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-slate-700 font-semibold">
+                          Total Línea: <span className="font-mono font-bold text-slate-900">{currency === 'USD' ? '$' : 'S/'} {(Number(it.quantity) * Number(it.unit_price)).toFixed(2)}</span>
+                        </div>
                       </div>
                     </div>
                   ))}
                 </div>
 
-                {/* Resumen de Totales */}
+                {/* Resumen de Totales Dinámico SUNAT */}
                 <div className="flex justify-end pt-3">
-                  <div className="bg-white p-4 rounded-2xl border border-slate-200 w-72 space-y-1.5 text-xs shadow-xs">
+                  <div className="bg-white p-4 rounded-2xl border border-slate-200 w-80 space-y-2 text-xs shadow-xs">
+                    {Number(totals.gravada) > 0 && (
+                      <div className="flex justify-between text-slate-600 font-medium">
+                        <span>Operación Gravada (Base):</span>
+                        <span className="font-mono font-bold text-slate-900">{currency === 'USD' ? '$' : 'S/'} {totals.gravada}</span>
+                      </div>
+                    )}
+                    {Number(totals.exonerada) > 0 && (
+                      <div className="flex justify-between text-emerald-800 font-bold bg-emerald-50 px-2 py-1 rounded-lg border border-emerald-200">
+                        <span className="flex items-center gap-1">
+                          <Leaf className="w-3 h-3 text-emerald-600" /> Op. Exonerada (0% IGV):
+                        </span>
+                        <span className="font-mono font-bold">{currency === 'USD' ? '$' : 'S/'} {totals.exonerada}</span>
+                      </div>
+                    )}
+                    {Number(totals.inafecta) > 0 && (
+                      <div className="flex justify-between text-purple-800 font-bold bg-purple-50 px-2 py-1 rounded-lg border border-purple-200">
+                        <span>Op. Inafecta (0% IGV):</span>
+                        <span className="font-mono font-bold">{currency === 'USD' ? '$' : 'S/'} {totals.inafecta}</span>
+                      </div>
+                    )}
+                    {Number(totals.gratuita) > 0 && (
+                      <div className="flex justify-between text-amber-800 font-bold bg-amber-50 px-2 py-1 rounded-lg border border-amber-200">
+                        <span>Op. Gratuita:</span>
+                        <span className="font-mono font-bold">{currency === 'USD' ? '$' : 'S/'} {totals.gratuita}</span>
+                      </div>
+                    )}
                     <div className="flex justify-between text-slate-600 font-medium">
-                      <span>Operación Gravada:</span>
-                      <span className="font-mono font-bold text-slate-900">{currency === 'USD' ? '$' : 'S/'} {totals.subtotal}</span>
-                    </div>
-                    <div className="flex justify-between text-slate-600 font-medium">
-                      <span>I.G.V. (18%):</span>
-                      <span className="font-mono font-bold text-slate-900">{currency === 'USD' ? '$' : 'S/'} {totals.igv}</span>
+                      <span>I.G.V. {Number(totals.gravada) > 0 ? '(18%)' : '(0.00)'}:</span>
+                      <span className={`font-mono font-bold ${Number(totals.igv) > 0 ? 'text-indigo-700' : 'text-slate-500'}`}>
+                        {currency === 'USD' ? '$' : 'S/'} {totals.igv}
+                      </span>
                     </div>
                     <div className="border-t border-slate-200 pt-2 flex justify-between font-bold text-sm text-slate-900">
                       <span>TOTAL A PAGAR:</span>
