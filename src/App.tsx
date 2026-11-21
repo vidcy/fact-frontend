@@ -35,6 +35,7 @@ import {
   MapPin,
   Sparkles,
   Leaf,
+  Eye,
 } from 'lucide-react';
 import { IntegrationModal } from './components/IntegrationModal';
 import { CompanyFormModal } from './components/CompanyFormModal';
@@ -110,6 +111,8 @@ interface DocumentRecord {
   status: string;
   sunat_response_code?: string;
   sunat_description?: string;
+  sunat_notes?: string[];
+  cdr_xml?: string | null;
   xml_digest_value?: string;
   qr_data?: string;
   created_at: string;
@@ -152,6 +155,7 @@ export function App() {
   const [fiscalAuditCompanyId, setFiscalAuditCompanyId] = useState<string | null>(null);
   const [showSeriesModal, setShowSeriesModal] = useState(false);
   const [seriesConfigCompany, setSeriesConfigCompany] = useState<Company | null>(null);
+  const [companySeries, setCompanySeries] = useState<Array<{ document_type: string; series: string; current_number: number }>>([]);
   const [diagnosticDoc, setDiagnosticDoc] = useState<DocumentRecord | null>(null);
 
   // Sistema Centralizado de Confirmación y Alertas Visuales
@@ -216,12 +220,15 @@ export function App() {
   const [vehiculoPlaca, setVehiculoPlaca] = useState('');
 
   // 8. Referencias Tributarias para Notas de Crédito (07) y Débito (08)
-  const [refDocType, setRefDocType] = useState<'01' | '03'>('01');
-  const [refSeries, setRefSeries] = useState('F001');
+  const [refDocType, setRefDocType] = useState<'01' | '03'>('03');
+  const [refSeries, setRefSeries] = useState('B001');
   const [refNumber, setRefNumber] = useState<number>(1);
+  const [refNumberStr, setRefNumberStr] = useState<string>('1');
   const [refReasonCode, setRefReasonCode] = useState('01');
   const [refReasonDesc, setRefReasonDesc] = useState('Anulación de la operación');
-  const [selectedRefDocId, setSelectedRefDocId] = useState<string>('');
+  const [linkedRefDoc, setLinkedRefDoc] = useState<DocumentRecord | null>(null);
+  const [searchingRefDoc, setSearchingRefDoc] = useState(false);
+  const [sunatConsultResult, setSunatConsultResult] = useState<any | null>(null);
 
   // 9. Datos del Adquiriente / Cliente
   const [clientDocType, setClientDocType] = useState('6');
@@ -231,6 +238,16 @@ export function App() {
   const [clientEmail, setClientEmail] = useState('contacto@andina.com.pe');
   const [lookingUpDoc, setLookingUpDoc] = useState(false);
   const [clientSunatStatus, setClientSunatStatus] = useState<{ estado: string; condicion: string; ubigeo?: string } | null>(null);
+
+  // Cálculo Dinámico en Tiempo Real del Correlativo Atómico Siguiente en SUNAT
+  const currentSeriesMatch = companySeries.find(
+    s => s.document_type === docType && s.series.toUpperCase() === series.trim().toUpperCase()
+  ) || companySeries.find(
+    s => s.document_type === docType
+  );
+  const currentLastNum = currentSeriesMatch ? Number(currentSeriesMatch.current_number) : 0;
+  const nextCorrelativeNum = currentLastNum + 1;
+  const nextCorrelativeFull = `${series.trim().toUpperCase()}-${String(nextCorrelativeNum).padStart(8, '0')}`;
 
   // 10. Consola Sandbox CCOFACT
   const [sandboxLoading, setSandboxLoading] = useState(false);
@@ -302,6 +319,7 @@ export function App() {
     if (currentCompany && adminToken) {
       fetchDocuments();
       fetchQueueStats();
+      fetchCompanySeries(currentCompany);
       updateDefaultSeries(docType);
       if (currentCompany.direccion && !puntoPartidaDireccion) {
         setPuntoPartidaDireccion(currentCompany.direccion);
@@ -356,11 +374,6 @@ export function App() {
       } else if (clientDocType !== '1' && clientDocType !== '0' && clientDocType !== '6') {
         setClientDocType('1');
       }
-      // Auto-seleccionar primer comprobante si no se ha elegido ninguno
-      const eligible = documents.find(d => (d.document_type === '01' || d.document_type === '03') && d.status !== 'ANULADO');
-      if (eligible && !selectedRefDocId) {
-        handleSelectReferenceDoc(eligible.id, '07');
-      }
     } else if (newType === '08') {
       // Nota de Débito: sincronizar serie y serie de referencia
       const s = refDocType === '01' ? 'FD01' : 'BD01';
@@ -371,60 +384,36 @@ export function App() {
       } else if (clientDocType !== '1' && clientDocType !== '0' && clientDocType !== '6') {
         setClientDocType('1');
       }
-      const eligible = documents.find(d => (d.document_type === '01' || d.document_type === '03') && d.status !== 'ANULADO');
-      if (eligible && !selectedRefDocId) {
-        handleSelectReferenceDoc(eligible.id, '08');
-      }
     } else if (newType === '09') {
       setSeries('T001');
     }
   };
 
-  // Cambio sincronizado del comprobante modificado (Factura vs Boleta) con ajuste estricto de serie y receptor
-  const handleRefDocTypeChange = (newRefType: '01' | '03') => {
-    setRefDocType(newRefType);
-    if (newRefType === '01') {
-      setRefSeries('F001');
-      setClientDocType('6');
-      if (docType === '07') setSeries('FC01');
-      if (docType === '08') setSeries('FD01');
-    } else {
-      setRefSeries('B001');
-      setClientDocType('1');
-      if (docType === '07') setSeries('BC01');
-      if (docType === '08') setSeries('BD01');
-    }
-  };
-
-  // Selección interactiva de comprobante de referencia con autocompletado total
-  const handleSelectReferenceDoc = (docId: string, currentDocType: string = docType) => {
-    setSelectedRefDocId(docId);
-    if (!docId) return;
-
-    const found = documents.find(d => d.id === docId);
-    if (!found) return;
-
-    const refType = (found.document_type === '01' ? '01' : '03') as '01' | '03';
-    setRefDocType(refType);
+  // Autocompletado maestro a partir de un comprobante original
+  const populateFromDoc = (found: DocumentRecord, targetRefType: '01' | '03') => {
+    setLinkedRefDoc(found);
+    setRefDocType(targetRefType);
     setRefSeries(found.series);
     setRefNumber(found.number);
+    setRefNumberStr(String(found.number));
 
     // Sincronizar serie de la Nota de Crédito o Débito
-    if (currentDocType === '07') {
-      setSeries(refType === '01' ? 'FC01' : 'BC01');
+    if (docType === '07') {
+      setSeries(targetRefType === '01' ? 'FC01' : 'BC01');
       setRefReasonCode('01');
       setRefReasonDesc(`Anulación de la operación ${found.full_number}`);
-    } else if (currentDocType === '08') {
-      setSeries(refType === '01' ? 'FD01' : 'BD01');
+    } else if (docType === '08') {
+      setSeries(targetRefType === '01' ? 'FD01' : 'BD01');
       setRefReasonCode('01');
       setRefReasonDesc(`Intereses por mora de ${found.full_number}`);
     }
 
     // Datos del cliente
-    setClientDocType(found.client_doc_type || (refType === '01' ? '6' : '1'));
+    setClientDocType(found.client_doc_type || (targetRefType === '01' ? '6' : '1'));
     setClientDocNumber(found.client_doc_number || '');
     setClientName(found.client_name || '');
     if (found.client_address) setClientAddress(found.client_address);
+    if (found.client_email) setClientEmail(found.client_email);
     setCurrency((found.currency as any) || 'PEN');
 
     // Detectar afectación tributaria real del comprobante de origen
@@ -438,26 +427,226 @@ export function App() {
       originalAffectation = '30';
     }
 
-    // Asignar ítem de anulación con el monto exacto del comprobante original y su régimen de IGV
-    setItems([{
-      code: 'ANUL-01',
-      description: `Anulación de la operación de ${found.full_number}`,
-      unit_measure: 'ZZ',
-      quantity: 1,
-      unit_price: Number(found.total_amount),
-      igv_affectation_type: originalAffectation
-    }]);
+    // Si el comprobante original tiene líneas detalladas, cargarlas exactamente
+    if (found.items && found.items.length > 0) {
+      setItems(found.items.map(it => ({
+        code: it.code || 'ANUL',
+        description: it.description,
+        unit_measure: it.unit_measure || 'NIU',
+        quantity: Number(it.quantity),
+        unit_price: Number(it.unit_price),
+        igv_affectation_type: it.igv_affectation_type || originalAffectation
+      })));
+    } else {
+      setItems([{
+        code: 'ANUL-01',
+        description: `Anulación de la operación de ${found.full_number}`,
+        unit_measure: 'ZZ',
+        quantity: 1,
+        unit_price: Number(found.total_amount),
+        igv_affectation_type: originalAffectation
+      }]);
+    }
+  };
 
-    setFeedbackAlert({
-      type: 'info',
-      message: `Comprobante ${found.full_number} vinculado (${originalAffectation === '20' ? 'Exonerado 0% IGV' : originalAffectation === '30' ? 'Inafecto 0% IGV' : 'Gravado 18% IGV'}). Serie ajustada a ${refType === '01' ? (currentDocType === '07' ? 'FC01' : 'FD01') : (currentDocType === '07' ? 'BC01' : 'BD01')}.`
+  // Cambio sincronizado del comprobante modificado (Factura vs Boleta) con ajuste estricto de serie y receptor
+  const handleRefDocTypeChange = (newRefType: '01' | '03') => {
+    setRefDocType(newRefType);
+    setSunatConsultResult(null);
+    setLinkedRefDoc(null);
+    if (newRefType === '01') {
+      setRefSeries('F001');
+      setClientDocType('6');
+      if (docType === '07') setSeries('FC01');
+      if (docType === '08') setSeries('FD01');
+    } else {
+      setRefSeries('B001');
+      setClientDocType('1');
+      if (docType === '07') setSeries('BC01');
+      if (docType === '08') setSeries('BD01');
+    }
+  };
+
+  // Consulta en vivo a los servidores de SUNAT (billConsultService getStatusCdr)
+  const handleConsultarSunatEnVivo = async (customSeries?: string, customNumber?: number, customType?: '01' | '03') => {
+    let s = (customSeries || refSeries).trim().toUpperCase();
+    let n = Number(customNumber || refNumber || parseInt(refNumberStr, 10) || 1);
+    let t = customType || refDocType;
+
+    // Si el usuario ingresó o pegó formato con guión ej. B001-000001 o B001-21
+    if (s.includes('-')) {
+      const parts = s.split('-');
+      s = parts[0].trim().toUpperCase();
+      const parsedNum = parseInt(parts[1], 10);
+      if (!isNaN(parsedNum) && parsedNum > 0) {
+        n = parsedNum;
+        setRefNumber(parsedNum);
+        setRefNumberStr(parts[1].trim());
+      }
+      setRefSeries(s);
+    }
+
+    // Auto-detección inteligente del tipo por la letra inicial de la serie
+    if (s.startsWith('F')) {
+      t = '01';
+      setRefDocType('01');
+      if (docType === '07') setSeries('FC01');
+      if (docType === '08') setSeries('FD01');
+    } else if (s.startsWith('B')) {
+      t = '03';
+      setRefDocType('03');
+      if (docType === '07') setSeries('BC01');
+      if (docType === '08') setSeries('BD01');
+    }
+
+    if (!s || !n || n <= 0) {
+      setFeedbackAlert({
+        type: 'error',
+        message: 'Ingresa una serie válida (ej. B001 o F001) y un número correlativo mayor a 0 para consultar en SUNAT.'
+      });
+      return;
+    }
+
+    if (!currentCompany?.api_key) {
+      setFeedbackAlert({
+        type: 'error',
+        message: 'Debe seleccionar una empresa activa con API Key para realizar la consulta oficial a SUNAT.'
+      });
+      return;
+    }
+
+    setSearchingRefDoc(true);
+    setSunatConsultResult(null);
+
+    try {
+      const res = await fetch(`${API_BASE}/documents/consultar-validez-sunat`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': currentCompany.api_key,
+        },
+        body: JSON.stringify({
+          docType: t,
+          series: s,
+          number: n,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.message || 'Error al conectar con los servidores de SUNAT');
+      }
+
+      setSunatConsultResult(data);
+
+      if (data.official_status === 'ACEPTADO') {
+        if (data.document) {
+          setLinkedRefDoc(data.document);
+          populateFromDoc(data.document, t);
+          setDocuments(prev => [data.document, ...prev.filter(d => d.id !== data.document.id)]);
+        } else {
+          // Documento existe en SUNAT pero fue emitido directamente en el portal web de SUNAT (externo) o en Control Finanzas
+          setLinkedRefDoc(null);
+          // Si SUNAT o el backend devolvió los datos del cliente desde el CDR oficial:
+          if (data.recipient?.doc_number) {
+            const rType = data.recipient.doc_type || (t === '01' ? '6' : '1');
+            setClientDocType(rType);
+            setClientDocNumber(data.recipient.doc_number);
+            if (data.recipient.name) {
+              setClientName(data.recipient.name);
+            } else {
+              handleLookupDoc(data.recipient.doc_number, rType);
+            }
+          }
+          if (data.recipient?.address) {
+            setClientAddress(data.recipient.address);
+          }
+          // Cargar los bienes y productos vendidos para la Nota de Crédito / Débito
+          if (data.items && data.items.length > 0) {
+            setItems(data.items.map((it: any) => ({
+              code: it.code || 'PROD-01',
+              description: it.description,
+              unit_measure: it.unit_measure || 'NIU',
+              quantity: Number(it.quantity) || 1,
+              unit_price: Number(it.unit_price) || 0,
+              igv_affectation_type: '10',
+            })));
+          } else if (data.total_amount && Number(data.total_amount) > 0) {
+            setItems([{
+              code: 'REF-01',
+              description: `Operación comercial ${data.full_number}`,
+              unit_measure: 'NIU',
+              quantity: 1,
+              unit_price: Number(data.total_amount),
+              igv_affectation_type: '10',
+            }]);
+          }
+        }
+
+        setFeedbackAlert({
+          type: 'success',
+          message: `✓ SUNAT VERIFICADO: ${data.full_number} (${t === '01' ? 'Factura' : 'Boleta'}) aceptada en servidores de SUNAT con CDR Oficial.`
+        });
+      } else if (data.official_status === 'EN_PROCESO') {
+        setFeedbackAlert({
+          type: 'info',
+          message: `SUNAT: El comprobante ${data.full_number} se encuentra en proceso en SUNAT (Código ${data.sunat_response_code}).`
+        });
+      } else if (data.requires_sol_credentials || data.official_status === 'REQUIERE_CREDENCIALES_SOL') {
+        setLinkedRefDoc(null);
+        setFeedbackAlert({
+          type: 'info',
+          message: `Credenciales de Producción Requeridas: Configure su Usuario Secundario SOL y Clave SOL en el perfil de la empresa para consultar en tiempo real a SUNAT.`
+        });
+      } else {
+        setLinkedRefDoc(null);
+        setFeedbackAlert({
+          type: 'error',
+          message: `⚠️ SUNAT Oficial: El comprobante ${data.full_number} NO existe en SUNAT (Código ${data.sunat_response_code}: ${data.sunat_description || 'No encontrado'}).`
+        });
+      }
+    } catch (err: any) {
+      setFeedbackAlert({
+        type: 'error',
+        message: `Error consultando en SUNAT: ${err.message}`
+      });
+    } finally {
+      setSearchingRefDoc(false);
+    }
+  };
+
+  // Selección manual de comprobante de referencia con autocompletado total
+  const handleSelectReferenceDoc = (docId: string) => {
+    if (!docId) {
+      setLinkedRefDoc(null);
+      setSunatConsultResult(null);
+      return;
+    }
+
+    const found = documents.find(d => d.id === docId);
+    if (!found) return;
+
+    const refType = (found.document_type === '01' ? '01' : '03') as '01' | '03';
+    populateFromDoc(found, refType);
+    setSunatConsultResult({
+      success: true,
+      official_status: 'ACEPTADO',
+      document_type: found.document_type,
+      series: found.series,
+      number: found.number,
+      full_number: found.full_number,
+      sunat_response_code: found.sunat_response_code || '0',
+      sunat_description: found.sunat_description || 'Comprobante verificado con CDR Oficial.',
+      sunat_notes: found.sunat_notes || [],
+      cdr_xml: found.cdr_xml || null,
+      document: found,
     });
   };
 
   // Cargar comprobante directamente desde la tabla de documentos para emitir Nota de Crédito
   const prefillCreditNoteFromDoc = (doc: DocumentRecord) => {
     setDocType('07');
-    handleSelectReferenceDoc(doc.id, '07');
+    handleSelectReferenceDoc(doc.id);
     setActiveTab('emitir');
   };
 
@@ -520,6 +709,23 @@ export function App() {
     }
   };
 
+  // Consulta de series y correlativos oficiales de la empresa
+  const fetchCompanySeries = async (comp?: Company | null) => {
+    const target = comp || currentCompany;
+    if (!target?.api_key) return;
+    try {
+      const res = await fetch(`${API_BASE}/series`, {
+        headers: { 'x-api-key': target.api_key },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setCompanySeries(data || []);
+      }
+    } catch (err) {
+      console.error('Error cargando series:', err);
+    }
+  };
+
   // Consulta de comprobantes emitidos
   const fetchDocuments = async () => {
     if (!currentCompany) return;
@@ -530,6 +736,7 @@ export function App() {
       });
       const data = await res.json();
       setDocuments(data.data || []);
+      await fetchCompanySeries(currentCompany);
     } catch (err) {
       console.error('Error cargando documentos:', err);
     } finally {
@@ -897,6 +1104,7 @@ export function App() {
       const created = await res.json();
       await fetchDocuments();
       await fetchQueueStats();
+      await fetchCompanySeries();
       setIdempotencyKey('');
       
       setFeedbackAlert({
@@ -1157,7 +1365,7 @@ export function App() {
       details: [
         { label: 'Emisor Tributario', value: `${currentCompany.razon_social} (RUC ${currentCompany.ruc})` },
         { label: 'Tipo de Comprobante', value: docName },
-        { label: 'Serie y Correlativo', value: `${series} (Siguiente Correlativo Atómico)` },
+        { label: 'Serie y Correlativo Oficial', value: `${nextCorrelativeFull} (Continuación Atómica SUNAT)` },
         { label: docType === '09' ? 'Destinatario' : 'Cliente Receptor', value: `${clientName} (${clientDocType === '6' ? 'RUC' : clientDocType === '1' ? 'DNI' : 'Doc'}: ${cleanDocNum})` },
         ...(docType === '09' ? [
           { label: 'Motivo Traslado', value: `${motivoTraslado} - ${motivoTrasladoDesc}` },
@@ -2176,6 +2384,35 @@ export function App() {
               const diagnostics = getSunatValidationDiagnostics();
               return (
                 <form onSubmit={handleSubmitEmission} className="space-y-6">
+                  {/* BARRA SUPERIOR DE CORRELATIVO Y SECUENCIA FISCAL SUNAT */}
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 px-4 py-2.5 bg-slate-50 border border-slate-200/90 rounded-2xl text-xs shadow-2xs">
+                    <div className="flex items-center gap-2.5 flex-wrap">
+                      <span className="relative flex h-2 w-2">
+                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                        <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                      </span>
+                      <span className="text-slate-600 font-medium">Secuencia Fiscal SUNAT:</span>
+                      <span className="font-mono font-black text-indigo-950 bg-white px-2.5 py-0.5 rounded-lg border border-indigo-200 shadow-2xs">
+                        Próximo comprobante: {nextCorrelativeFull}
+                      </span>
+                      <span className="text-slate-400 font-medium text-[11px]">
+                        (Último registrado: #{currentLastNum})
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSeriesConfigCompany(currentCompany);
+                        setShowSeriesModal(true);
+                      }}
+                      className="text-[11px] font-bold text-indigo-700 hover:text-indigo-900 bg-white hover:bg-indigo-50 px-3 py-1 rounded-xl border border-indigo-200 shadow-2xs transition cursor-pointer flex items-center gap-1.5 self-start sm:self-auto shrink-0"
+                      title="Inicializar correlativos para continuar la numeración oficial emitida en SUNAT"
+                    >
+                      <Hash className="w-3.5 h-3.5 text-indigo-600" />
+                      <span>⚙️ Inicializar Correlativo SUNAT</span>
+                    </button>
+                  </div>
+
                   {/* Selector de Tipo y Serie */}
                   <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
                     <div>
@@ -2196,18 +2433,9 @@ export function App() {
                     <div>
                       <div className="flex items-center justify-between mb-1.5">
                         <label className="block text-xs font-semibold text-slate-700">Serie Fiscal</label>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setSeriesConfigCompany(currentCompany);
-                            setShowSeriesModal(true);
-                          }}
-                          className="text-[11px] text-indigo-600 hover:text-indigo-800 font-bold flex items-center gap-1 cursor-pointer bg-indigo-50/80 px-2 py-0.5 rounded-md border border-indigo-200 hover:bg-indigo-100 transition"
-                          title="Configurar correlativos iniciales y series fiscales para sincronizar con SUNAT"
-                        >
-                          <Hash className="w-3 h-3 text-indigo-600" />
-                          <span>Configurar Correlativo</span>
-                        </button>
+                        <span className="text-[10px] font-mono text-indigo-600 font-bold bg-indigo-50 px-1.5 py-0.5 rounded border border-indigo-200">
+                          #{currentLastNum + 1}
+                        </span>
                       </div>
                       <input
                         type="text"
@@ -2217,12 +2445,12 @@ export function App() {
                         placeholder={docType === '01' ? 'F001' : docType === '03' ? 'B001' : docType === '07' ? (refDocType === '01' ? 'FC01' : 'BC01') : docType === '08' ? (refDocType === '01' ? 'FD01' : 'BD01') : 'T001'}
                         required
                       />
-                      <p className="text-[10px] text-slate-500 mt-1">
-                        {docType === '01' ? 'Facturas: F001 a F999 (RUC obligatorio)' :
-                         docType === '03' ? 'Boletas: B001 a B999 (DNI o consumidor final)' :
-                         docType === '07' ? (refDocType === '01' ? 'Nota Crédito Factura: FC01 a FC99' : 'Nota Crédito Boleta: BC01 a BC99') :
-                         docType === '08' ? (refDocType === '01' ? 'Nota Débito Factura: FD01 a FD99' : 'Nota Débito Boleta: BD01 a BD99') :
-                         'Guía Remitente: T001 a T999'}
+                      <p className="text-[10px] text-slate-500 mt-1 truncate">
+                        {docType === '01' ? 'Facturas: F001 a F999' :
+                         docType === '03' ? 'Boletas: B001 a B999' :
+                         docType === '07' ? (refDocType === '01' ? 'NC: FC01 a FC99' : 'NC: BC01 a BC99') :
+                         docType === '08' ? (refDocType === '01' ? 'ND: FD01 a FD99' : 'ND: BD01 a BD99') :
+                         'Guías: T001 a T999'}
                       </p>
                     </div>
 
@@ -2336,104 +2564,331 @@ export function App() {
                     )}
                   </div>
 
-                  {/* SECCIÓN NOTAS DE CRÉDITO Y DÉBITO */}
+                  {/* SECCIÓN NOTAS DE CRÉDITO Y DÉBITO: VERIFICACIÓN Y CONSULTA EN VIVO A SUNAT */}
                   {(docType === '07' || docType === '08') && (
-                    <div className="border border-amber-200 bg-amber-50/40 rounded-2xl p-5 space-y-4">
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center gap-2 text-amber-800 font-bold text-xs uppercase tracking-wider">
-                          <FileText className="w-4 h-4 text-amber-600" />
-                          <span>Datos Obligatorios del Comprobante Modificado ({docType === '07' ? 'Nota de Crédito' : 'Nota de Débito'})</span>
+                    <div className="border-2 border-indigo-200/80 bg-gradient-to-br from-indigo-50/50 via-slate-50 to-white rounded-3xl p-5 md:p-6 shadow-sm space-y-5">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-indigo-100 pb-3">
+                        <div className="flex items-center gap-2.5">
+                          <div className="w-9 h-9 rounded-xl bg-indigo-600 text-white flex items-center justify-center font-black shadow-md shadow-indigo-600/20 shrink-0">
+                            <ShieldCheck className="w-5 h-5" />
+                          </div>
+                          <div>
+                            <h3 className="text-slate-900 font-extrabold text-sm tracking-tight flex items-center gap-2">
+                              <span>Consulta y Verificación Oficial en SUNAT (En Vivo)</span>
+                              <span className="text-[10px] bg-emerald-100 text-emerald-800 font-bold px-2 py-0.5 rounded-full border border-emerald-300 flex items-center gap-1">
+                                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                                WebService billConsultService
+                              </span>
+                            </h3>
+                            <p className="text-xs text-slate-500 font-medium">
+                              Valida el comprobante original en los servidores de SUNAT para asegurar validez del CDR antes de emitir la {docType === '07' ? 'Nota de Crédito' : 'Nota de Débito'}.
+                            </p>
+                          </div>
                         </div>
-                        <span className="text-[10px] bg-amber-100 text-amber-800 font-bold px-2 py-0.5 rounded-full border border-amber-300">
+                        <span className="text-[11px] bg-indigo-100 text-indigo-800 font-bold px-3 py-1 rounded-full border border-indigo-200 shrink-0 self-start sm:self-auto">
                           Catálogo {docType === '07' ? '09 NC' : '10 ND'} SUNAT
                         </span>
                       </div>
 
-                      {/* Selector Inteligente de Comprobante Emitido */}
-                      <div className="bg-white p-3.5 rounded-xl border border-amber-200 shadow-2xs space-y-1.5">
-                        <div className="flex items-center justify-between">
+                      {/* Selector de Tipo (Pills) + Serie + Correlativo + Botón Consulta */}
+                      <div className="grid grid-cols-1 md:grid-cols-12 gap-3.5 items-end">
+                        {/* Tipo de Comprobante */}
+                        <div className="md:col-span-4 space-y-1.5">
                           <label className="block text-slate-800 font-bold text-xs">
-                            Selecciona un comprobante emitido para autocompletar todo automáticamente:
+                            Comprobante Afectado / Modificado *
                           </label>
-                          <span className="text-[10px] text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded-full font-bold border border-indigo-200">
-                            {documents.filter(d => (d.document_type === '01' || d.document_type === '03') && d.status !== 'ANULADO').length} disponibles
-                          </span>
-                        </div>
-                        <select
-                          value={selectedRefDocId}
-                          onChange={(e) => handleSelectReferenceDoc(e.target.value)}
-                          className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-bold text-slate-900 outline-none cursor-pointer focus:bg-white focus:border-amber-500"
-                        >
-                          <option value="">-- Ingreso Manual o Selecciona de la lista --</option>
-                          {documents
-                            .filter(d => (d.document_type === '01' || d.document_type === '03') && d.status !== 'ANULADO')
-                            .map(d => (
-                              <option key={d.id} value={d.id}>
-                                {d.full_number} ({d.document_type === '01' ? 'Factura' : 'Boleta'}) - {d.client_name} - {d.currency === 'USD' ? '$' : 'S/'} {Number(d.total_amount).toFixed(2)} [{d.status}]
-                              </option>
-                            ))}
-                        </select>
-                        {selectedRefDocId && (
-                          <p className="text-[11px] text-emerald-700 font-semibold flex items-center gap-1 pt-0.5">
-                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-                            Comprobante vinculado. Serie ajustada automáticamente y datos del cliente precargados.
-                          </p>
-                        )}
-                      </div>
-
-                      <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
-                        <div>
-                          <label className="block text-slate-800 font-bold mb-1">
-                            Tipo de Comprobante Afectado *
-                          </label>
-                          <select
-                            value={refDocType}
-                            onChange={(e) => handleRefDocTypeChange(e.target.value as any)}
-                            className="w-full bg-white border border-amber-300 rounded-xl px-3 py-2 text-slate-900 font-bold outline-none focus:ring-2 focus:ring-amber-400"
-                          >
-                            <option value="01">01 - FACTURA ELECTRÓNICA</option>
-                            <option value="03">03 - BOLETA DE VENTA</option>
-                          </select>
-                          <p className="text-[10px] text-amber-800 mt-1">
-                            {refDocType === '01' ? 'Afecta a Factura (exige RUC)' : 'Afecta a Boleta (DNI o Consumidor)'}
-                          </p>
+                          <div className="grid grid-cols-2 gap-1.5 bg-slate-100 p-1 rounded-2xl border border-slate-200">
+                            <button
+                              type="button"
+                              onClick={() => handleRefDocTypeChange('03')}
+                              className={`py-2 px-2 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer ${
+                                refDocType === '03'
+                                  ? 'bg-white text-indigo-700 shadow-sm border border-indigo-200'
+                                  : 'text-slate-600 hover:text-slate-900'
+                              }`}
+                            >
+                              <FileText className="w-3.5 h-3.5" />
+                              <span>03 - Boleta</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleRefDocTypeChange('01')}
+                              className={`py-2 px-2 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer ${
+                                refDocType === '01'
+                                  ? 'bg-white text-indigo-700 shadow-sm border border-indigo-200'
+                                  : 'text-slate-600 hover:text-slate-900'
+                              }`}
+                            >
+                              <Building2 className="w-3.5 h-3.5" />
+                              <span>01 - Factura</span>
+                            </button>
+                          </div>
                         </div>
 
-                        <div>
-                          <label className="block text-slate-800 font-bold mb-1">
-                            Serie Original en SUNAT *
+                        {/* Serie Original */}
+                        <div className="md:col-span-2 space-y-1.5">
+                          <label className="block text-slate-800 font-bold text-xs">
+                            Serie en SUNAT *
                           </label>
                           <input
                             type="text"
                             value={refSeries}
-                            onChange={(e) => setRefSeries(e.target.value.toUpperCase())}
-                            className="w-full bg-white border border-amber-300 rounded-xl px-3 py-2 font-mono font-bold text-slate-900 outline-none focus:ring-2 focus:ring-amber-400"
+                            onChange={(e) => {
+                              const val = e.target.value.toUpperCase();
+                              if (val.includes('-')) {
+                                const parts = val.split('-');
+                                setRefSeries(parts[0].trim());
+                                const parsedNum = parseInt(parts[1], 10);
+                                if (!isNaN(parsedNum) && parsedNum > 0) {
+                                  setRefNumber(parsedNum);
+                                  setRefNumberStr(parts[1].trim());
+                                }
+                                if (parts[0].startsWith('F')) handleRefDocTypeChange('01');
+                                else if (parts[0].startsWith('B')) handleRefDocTypeChange('03');
+                              } else {
+                                setRefSeries(val);
+                                if (val.startsWith('F') && refDocType !== '01') handleRefDocTypeChange('01');
+                                else if (val.startsWith('B') && refDocType !== '03') handleRefDocTypeChange('03');
+                              }
+                              setSunatConsultResult(null);
+                            }}
+                            className="w-full bg-white border border-slate-300 rounded-xl px-3 py-2 font-mono font-black text-slate-900 text-center uppercase outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 shadow-2xs"
                             placeholder={refDocType === '01' ? 'F001' : 'B001'}
                             required
                           />
-                          <p className="text-[10px] text-amber-800 mt-1">
-                            {refDocType === '01' ? 'Serie de Factura (inicia con F)' : 'Serie de Boleta (inicia con B)'}
-                          </p>
                         </div>
 
-                        <div>
-                          <label className="block text-slate-800 font-bold mb-1">
-                            Número Correlativo Original *
+                        {/* Correlativo Original */}
+                        <div className="md:col-span-2 space-y-1.5">
+                          <label className="block text-slate-800 font-bold text-xs">
+                            Nº Correlativo *
                           </label>
                           <input
-                            type="number"
-                            min="1"
-                            value={refNumber}
-                            onChange={(e) => setRefNumber(parseInt(e.target.value, 10) || 1)}
-                            className="w-full bg-white border border-amber-300 rounded-xl px-3 py-2 font-mono font-bold text-slate-900 outline-none focus:ring-2 focus:ring-amber-400"
-                            placeholder="Ej: 21"
+                            type="text"
+                            value={refNumberStr}
+                            onChange={(e) => {
+                              const rawVal = e.target.value;
+                              setRefNumberStr(rawVal);
+                              const parsed = parseInt(rawVal, 10);
+                              setRefNumber(isNaN(parsed) ? 1 : parsed);
+                              setSunatConsultResult(null);
+                            }}
+                            className="w-full bg-white border border-slate-300 rounded-xl px-3 py-2 font-mono font-black text-slate-900 text-center outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 shadow-2xs"
+                            placeholder="Ej: 1 o 21"
                             required
                           />
-                          <p className="text-[10px] text-amber-800 mt-1">
-                            Correlativo exacto declarado (ej. si fue {refSeries}-21, escribe 21)
-                          </p>
+                        </div>
+
+                        {/* Botón de Consulta Oficial */}
+                        <div className="md:col-span-4">
+                          <button
+                            type="button"
+                            onClick={() => handleConsultarSunatEnVivo()}
+                            disabled={searchingRefDoc}
+                            className="w-full flex items-center justify-center gap-2 bg-gradient-to-r from-indigo-600 via-blue-600 to-indigo-700 hover:from-indigo-700 hover:to-blue-800 text-white font-bold py-2.5 px-4 rounded-xl text-xs shadow-md shadow-indigo-600/25 transition cursor-pointer disabled:opacity-50"
+                          >
+                            {searchingRefDoc ? (
+                              <>
+                                <RotateCw className="w-4 h-4 animate-spin text-white" />
+                                <span>Consultando en SUNAT...</span>
+                              </>
+                            ) : (
+                              <>
+                                <Search className="w-4 h-4" />
+                                <span>⚡ Consultar Validez en SUNAT</span>
+                              </>
+                            )}
+                          </button>
                         </div>
                       </div>
+
+                      {/* RESULTADO OFICIAL EN VIVO DE SUNAT */}
+                      {sunatConsultResult && (
+                        <div className="animate-in fade-in-50 duration-200">
+                          {sunatConsultResult.requires_sol_credentials || sunatConsultResult.official_status === 'REQUIERE_CREDENCIALES_SOL' ? (
+                            <div className="bg-amber-50/90 border-2 border-amber-300 rounded-2xl p-4 text-xs space-y-2.5 shadow-2xs">
+                              <div className="flex items-center gap-2 font-black text-amber-900 text-sm">
+                                <AlertCircle className="w-5 h-5 text-amber-600 shrink-0" />
+                                <span>Credenciales Secundarias SOL de Producción Requeridas para Consulta en Vivo</span>
+                              </div>
+                              <p className="text-amber-800 leading-relaxed font-medium">
+                                {sunatConsultResult.sunat_description || 'Para consultar comprobantes emitidos en el portal de SUNAT directamente en tiempo real, configure su Usuario Secundario SOL y Clave SOL en el perfil de su empresa.'}
+                              </p>
+                              <div className="flex flex-wrap items-center gap-2 pt-1 border-t border-amber-200/80">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setCompanyToEdit(currentCompany);
+                                    setShowCompanyFormModal(true);
+                                  }}
+                                  className="bg-amber-600 hover:bg-amber-700 text-white font-bold px-3.5 py-1.5 rounded-xl transition cursor-pointer flex items-center gap-1.5 shadow-xs"
+                                >
+                                  ⚙️ Configurar Credenciales SOL de Empresa
+                                </button>
+                                <span className="text-amber-700 text-[11px] font-medium">
+                                  ✓ El comprobante referenciado {refSeries}-{refNumber} se enviará legalmente a SUNAT al emitir la Nota.
+                                </span>
+                              </div>
+                            </div>
+                          ) : sunatConsultResult.official_status === 'ACEPTADO' ? (
+                            <div className="bg-white border-2 border-emerald-500/80 rounded-2xl p-4 shadow-sm space-y-3.5">
+                              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-emerald-100 pb-3">
+                                <div className="flex items-center gap-3">
+                                  <div className="w-11 h-11 rounded-xl bg-emerald-50 text-emerald-800 border-2 border-emerald-300 flex items-center justify-center font-black text-xs shrink-0 shadow-xs">
+                                    {refDocType === '01' ? 'FAC' : 'BOL'}
+                                  </div>
+                                  <div>
+                                    <div className="flex items-center gap-2">
+                                      <span className="font-black text-slate-900 text-sm tracking-tight">
+                                        {sunatConsultResult.full_number}
+                                      </span>
+                                      <span className="text-[10px] bg-emerald-100 text-emerald-800 font-extrabold px-2.5 py-0.5 rounded-full border border-emerald-300 flex items-center gap-1">
+                                        <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                                        SUNAT CDR: CÓDIGO {sunatConsultResult.sunat_response_code || '0'} (ACEPTADO)
+                                      </span>
+                                    </div>
+                                    <p className="text-xs text-slate-600 font-medium">
+                                      {sunatConsultResult.sunat_description || 'El comprobante ha sido aceptado por SUNAT.'}
+                                    </p>
+                                  </div>
+                                </div>
+
+                                <div className="flex items-center gap-2 shrink-0">
+                                  {linkedRefDoc && (
+                                    <button
+                                      type="button"
+                                      onClick={() => openPreview(linkedRefDoc)}
+                                      className="flex items-center gap-1.5 bg-gradient-to-r from-indigo-600 to-blue-600 hover:from-indigo-700 hover:to-blue-700 text-white text-xs font-bold px-3.5 py-2 rounded-xl shadow-md shadow-indigo-500/20 transition cursor-pointer"
+                                      title="Visualizar la representación oficial de SUNAT con código QR y constancia de recepción"
+                                    >
+                                      <Eye className="w-3.5 h-3.5" />
+                                      <span>👁️ Ver Boleta Oficial SUNAT</span>
+                                    </button>
+                                  )}
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setSunatConsultResult(null);
+                                      setLinkedRefDoc(null);
+                                    }}
+                                    className="text-slate-400 hover:text-slate-700 text-xs font-semibold px-2.5 py-2 rounded-xl border border-slate-200 hover:bg-slate-50 transition cursor-pointer"
+                                    title="Limpiar consulta"
+                                  >
+                                    ✕ Limpiar
+                                  </button>
+                                </div>
+                              </div>
+
+                              {/* Ficha de Datos Tributarios Verificados */}
+                              <div className="space-y-3">
+                                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs bg-emerald-50/40 p-3.5 rounded-xl border border-emerald-200/60">
+                                  <div>
+                                    <span className="text-slate-500 block text-[10px] font-bold uppercase tracking-wider">Cliente Adquirente</span>
+                                    <span className="font-extrabold text-slate-900 block truncate text-xs">
+                                      {(linkedRefDoc?.client_doc_type || sunatConsultResult.recipient?.doc_type) === '6' ? 'RUC' : 'DNI'}{' '}
+                                      {linkedRefDoc?.client_doc_number || sunatConsultResult.recipient?.doc_number || '-'}
+                                    </span>
+                                    <p className="text-slate-700 truncate font-medium text-[11px]">
+                                      {linkedRefDoc?.client_name || sunatConsultResult.recipient?.name || clientName || 'Receptor Verificado'}
+                                    </p>
+                                  </div>
+                                  <div>
+                                    <span className="text-slate-500 block text-[10px] font-bold uppercase tracking-wider">Fecha & Estado SUNAT</span>
+                                    <span className="font-extrabold text-slate-900 block text-xs">
+                                      {sunatConsultResult.issue_date || linkedRefDoc?.issue_date || 'Fecha registrada en SUNAT'}
+                                    </span>
+                                    <p className="text-emerald-700 text-[11px] font-bold flex items-center gap-1">
+                                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 inline" /> CDR Oficial Aceptado
+                                    </p>
+                                  </div>
+                                  <div className="text-left sm:text-right sm:border-l sm:border-emerald-200/80 sm:pl-3 flex flex-col justify-center">
+                                    <span className="text-slate-500 text-[10px] font-bold uppercase tracking-wider">Monto Total Declarado</span>
+                                    <span className="text-xl font-black font-mono text-emerald-700">
+                                      S/ {Number(sunatConsultResult.total_amount || linkedRefDoc?.total_amount || 0).toFixed(2)}
+                                    </span>
+                                  </div>
+                                </div>
+
+                                {/* Tabla de Bienes / Productos Vendidos */}
+                                {((linkedRefDoc?.items && linkedRefDoc.items.length > 0) || (sunatConsultResult.items && sunatConsultResult.items.length > 0)) ? (
+                                  <div className="bg-white rounded-xl border border-emerald-200 overflow-hidden shadow-2xs">
+                                    <div className="bg-emerald-50/80 px-3 py-2 border-b border-emerald-200 flex items-center justify-between">
+                                      <span className="font-bold text-[11px] text-emerald-950 uppercase tracking-wide flex items-center gap-1.5">
+                                        📦 Bienes / Productos Vendidos en este Comprobante ({sunatConsultResult.full_number})
+                                      </span>
+                                      <span className="text-[10px] font-bold text-emerald-800 bg-emerald-100 px-2 py-0.5 rounded-full border border-emerald-300">
+                                        ✓ Precargados en la Nota
+                                      </span>
+                                    </div>
+                                    <div className="overflow-x-auto">
+                                      <table className="w-full text-left text-xs">
+                                        <thead className="bg-slate-50 text-[10px] font-bold text-slate-600 uppercase border-b border-slate-100">
+                                          <tr>
+                                            <th className="px-3 py-1.5">Bien / Producto Vendido</th>
+                                            <th className="px-3 py-1.5 text-center">Cant.</th>
+                                            <th className="px-3 py-1.5 text-right">Precio Unit.</th>
+                                            <th className="px-3 py-1.5 text-right">Total</th>
+                                          </tr>
+                                        </thead>
+                                        <tbody className="divide-y divide-slate-100">
+                                          {((linkedRefDoc?.items && linkedRefDoc.items.length > 0) ? linkedRefDoc.items : sunatConsultResult.items).map((it: any, idx: number) => (
+                                            <tr key={idx} className="hover:bg-slate-50/50">
+                                              <td className="px-3 py-2 font-bold text-slate-800">{it.description}</td>
+                                              <td className="px-3 py-2 text-center font-mono font-semibold text-slate-700">{it.quantity}</td>
+                                              <td className="px-3 py-2 text-right font-mono text-slate-700">S/ {Number(it.unit_price).toFixed(2)}</td>
+                                              <td className="px-3 py-2 text-right font-mono font-bold text-emerald-700">S/ {Number(it.total || (Number(it.quantity) * Number(it.unit_price))).toFixed(2)}</td>
+                                            </tr>
+                                          ))}
+                                        </tbody>
+                                        <tfoot className="bg-emerald-50/40 border-t border-emerald-200 font-bold text-xs">
+                                          <tr>
+                                            <td colSpan={3} className="px-3 py-2 text-right text-slate-700 uppercase font-black">Total Declarado:</td>
+                                            <td className="px-3 py-2 text-right font-mono font-black text-emerald-800 text-sm">
+                                              S/ {Number(sunatConsultResult.total_amount || linkedRefDoc?.total_amount || 0).toFixed(2)}
+                                            </td>
+                                          </tr>
+                                        </tfoot>
+                                      </table>
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <div className="p-2.5 bg-emerald-50/70 border border-emerald-300 rounded-xl text-[11px] text-emerald-900 flex items-center justify-between">
+                                    <span>
+                                      ✓ Comprobante <b>{sunatConsultResult.full_number}</b> verificado en servidores de SUNAT por un total de <b>S/ {Number(sunatConsultResult.total_amount || 0).toFixed(2)}</b>.
+                                    </span>
+                                    <span className="font-bold text-emerald-800">
+                                      Listo para emitir Nota
+                                    </span>
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          ) : sunatConsultResult.official_status === 'EN_PROCESO' ? (
+                            <div className="bg-amber-50 border-2 border-amber-300 rounded-2xl p-4 text-xs space-y-1">
+                              <div className="flex items-center gap-2 font-bold text-amber-900">
+                                <RotateCw className="w-4 h-4 animate-spin text-amber-600" />
+                                <span>SUNAT: Comprobante en Proceso de Validación (Código {sunatConsultResult.sunat_response_code})</span>
+                              </div>
+                              <p className="text-amber-800 font-medium">
+                                {sunatConsultResult.sunat_description || 'SUNAT aún está procesando el comprobante. Vuelve a consultar en unos minutos.'}
+                              </p>
+                            </div>
+                          ) : (
+                            <div className="bg-rose-50 border-2 border-rose-300 rounded-2xl p-4 text-xs space-y-1.5">
+                              <div className="flex items-center gap-2 font-black text-rose-900 text-sm">
+                                <AlertCircle className="w-4 h-4 text-rose-600" />
+                                <span>Comprobante no existe en SUNAT ({sunatConsultResult.full_number})</span>
+                              </div>
+                              <p className="text-rose-800 font-medium">
+                                SUNAT respondió: <b>{sunatConsultResult.sunat_description || 'El ticket no existe'}</b> (Código SUNAT: {sunatConsultResult.sunat_response_code || '0127'}).
+                              </p>
+                              <div className="bg-white/80 p-2.5 rounded-xl border border-rose-200 text-rose-700 text-[11px]">
+                                <strong>Validación Oficial SUNAT:</strong> El comprobante no figura como emitido ni aceptado en los servidores de SUNAT. Verifique la serie y el número ingresados. No se ha generado ningún registro ficticio en el sistema.
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
 
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
                     <div>
@@ -2787,9 +3242,17 @@ export function App() {
 
               {/* Datos del Cliente */}
               <div className="border border-slate-200 rounded-2xl p-4 bg-slate-50/50 space-y-4">
-                <h4 className="text-xs font-bold text-slate-700 uppercase tracking-wider">
-                  {docType === '09' ? 'Datos del Destinatario (Receptor de la Carga)' : 'Datos del Adquiriente / Cliente'}
-                </h4>
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                  <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wider">
+                    {docType === '09' ? 'Datos del Destinatario (Receptor de la Carga)' : 'Datos del Adquiriente / Cliente'}
+                  </h4>
+                  {linkedRefDoc && (
+                    <span className="text-[11px] text-emerald-800 bg-emerald-100/90 px-2.5 py-0.5 rounded-full font-bold border border-emerald-300 flex items-center gap-1">
+                      <Check className="w-3.5 h-3.5 text-emerald-600" />
+                      Datos cargados automáticamente desde {linkedRefDoc.full_number}
+                    </span>
+                  )}
+                </div>
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
                   <div>
                     <label className="block font-semibold text-slate-700 mb-1">Tipo de Documento</label>
@@ -4231,6 +4694,7 @@ Idempotency-Key: cco_order_987654 (Opcional pero recomendado para cero duplicado
         onSaved={async () => {
           await fetchDocuments();
           await fetchCompanies();
+          await fetchCompanySeries();
         }}
       />
 
