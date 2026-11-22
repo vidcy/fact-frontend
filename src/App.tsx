@@ -1763,7 +1763,10 @@ export function App() {
   // Métricas calculadas para Dashboard
   const totalInvoiced = documents.reduce((acc, d) => acc + (Number(d.total_amount) || 0), 0);
   const acceptedCount = documents.filter(d => d.status.includes('ACCEPTED')).length;
-  const queuedCount = documents.filter(d => d.status === 'QUEUED' || d.status === 'SENDING').length;
+  const queuedCount = Math.max(
+    documents.filter(d => d.status === 'QUEUED' || d.status === 'SENDING').length,
+    Number(queueStats.counts?.find((c: any) => c.status === 'PENDING')?.count || queueStats.counts?.find((c: any) => c.status === 'PENDING')?._count?.id || queueStats.queuedDocsCount || 0),
+  );
   const rejectedCount = documents.filter(d => d.status === 'REJECTED' || d.status === 'FAILED_RETRY').length;
   const successRate = documents.length > 0 ? Math.round((acceptedCount / documents.length) * 100) : 100;
 
@@ -4275,7 +4278,7 @@ export function App() {
               <div className="bg-white border border-slate-200/80 rounded-3xl p-5 space-y-2 shadow-xs">
                 <span className="text-xs text-slate-500 font-bold uppercase">Pendientes de Envío</span>
                 <div className="text-3xl font-black text-amber-600 font-mono">
-                  {queueStats.counts?.find((c: any) => c.status === 'PENDING')?._count?.id || 0}
+                  {Number(queueStats.counts?.find((c: any) => c.status === 'PENDING')?.count ?? queueStats.counts?.find((c: any) => c.status === 'PENDING')?._count?.id ?? queueStats.queuedDocsCount ?? 0)}
                 </div>
                 <p className="text-[11px] text-slate-500">Comprobantes listos para entrega inmediata a SUNAT</p>
               </div>
@@ -4283,7 +4286,7 @@ export function App() {
               <div className="bg-white border border-slate-200/80 rounded-3xl p-5 space-y-2 shadow-xs">
                 <span className="text-xs text-slate-500 font-bold uppercase">Reintentos por Caída SUNAT</span>
                 <div className="text-3xl font-black text-rose-600 font-mono">
-                  {queueStats.counts?.find((c: any) => c.status === 'FAILED_RETRY')?._count?.id || 0}
+                  {Number(queueStats.counts?.find((c: any) => c.status === 'FAILED_RETRY')?.count ?? queueStats.counts?.find((c: any) => c.status === 'FAILED_RETRY')?._count?.id ?? 0)}
                 </div>
                 <p className="text-[11px] text-slate-500">Retroceso exponencial (15s, 1m, 5m, 15m, 1h)</p>
               </div>
@@ -4291,7 +4294,7 @@ export function App() {
               <div className="bg-white border border-slate-200/80 rounded-3xl p-5 space-y-2 shadow-xs">
                 <span className="text-xs text-slate-500 font-bold uppercase">Entregados con Éxito</span>
                 <div className="text-3xl font-black text-emerald-600 font-mono">
-                  {queueStats.counts?.find((c: any) => c.status === 'COMPLETED')?._count?.id || 0}
+                  {Number(queueStats.counts?.find((c: any) => c.status === 'COMPLETED')?.count ?? queueStats.counts?.find((c: any) => c.status === 'COMPLETED')?._count?.id ?? 0)}
                 </div>
                 <p className="text-[11px] text-slate-500">Procesados y confirmados con CDR</p>
               </div>
@@ -4312,6 +4315,20 @@ export function App() {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100 font-mono text-[11px]">
+                    {queueStats.queuedDocs?.map((qDoc: any) => (
+                      <tr key={`queued-doc-${qDoc.id}`} className="bg-amber-50/30">
+                        <td className="py-2.5 px-3 text-slate-500">{qDoc.id.substring(0, 8)}... (DOC)</td>
+                        <td className="py-2.5 px-3 text-indigo-600 font-bold">{qDoc.full_number}</td>
+                        <td className="py-2.5 px-3 text-slate-700">1 / 5</td>
+                        <td className="py-2.5 px-3 text-slate-500">Inmediato</td>
+                        <td className="py-2.5 px-3 text-amber-700 font-sans truncate max-w-[200px]">{qDoc.sunat_description || 'Encolado para despacho'}</td>
+                        <td className="py-2.5 px-3 text-center">
+                          <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200">
+                            PENDING (DOC)
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
                     {queueStats.recentJobs?.map((job: any) => (
                       <tr key={job.id}>
                         <td className="py-2.5 px-3 text-slate-500">{job.id.substring(0, 8)}...</td>
@@ -4326,7 +4343,7 @@ export function App() {
                         </td>
                       </tr>
                     ))}
-                    {(!queueStats.recentJobs || queueStats.recentJobs.length === 0) && (
+                    {(!queueStats.recentJobs || queueStats.recentJobs.length === 0) && (!queueStats.queuedDocs || queueStats.queuedDocs.length === 0) && (
                       <tr>
                         <td colSpan={6} className="py-6 text-center text-slate-400 font-sans">
                           No hay trabajos pendientes en cola. Todos los comprobantes fueron entregados en tiempo real.
