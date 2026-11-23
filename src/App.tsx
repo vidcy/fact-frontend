@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   FileText,
   Send,
@@ -148,6 +148,41 @@ export function App() {
   const [loading, setLoading] = useState(false);
   const [copiedKey, setCopiedKey] = useState(false);
   const [queueStats, setQueueStats] = useState<any>({ counts: [], recentJobs: [] });
+
+  // Filtros y Paginación en Documentos
+  const [docSearchTerm, setDocSearchTerm] = useState('');
+  const [docFilterType, setDocFilterType] = useState('ALL');
+  const [docFilterStatus, setDocFilterStatus] = useState('ALL');
+  const [docPage, setDocPage] = useState(1);
+  const [docPageSize, setDocPageSize] = useState(25);
+
+  const filteredDocRecords = useMemo(() => {
+    return documents.filter((d) => {
+      if (docFilterType !== 'ALL' && d.document_type !== docFilterType) return false;
+      if (docFilterStatus === 'ACCEPTED' && !d.status.includes('ACCEPTED')) return false;
+      if (docFilterStatus === 'ANULADO' && d.status !== 'ANULADO') return false;
+      if (docFilterStatus === 'REJECTED' && (d.status.includes('ACCEPTED') || d.status === 'ANULADO')) return false;
+
+      if (docSearchTerm.trim()) {
+        const term = docSearchTerm.toLowerCase();
+        const matchNumber = d.full_number?.toLowerCase().includes(term);
+        const matchName = d.client_name?.toLowerCase().includes(term);
+        const matchDoc = d.client_doc_number?.toLowerCase().includes(term);
+        return matchNumber || matchName || matchDoc;
+      }
+      return true;
+    });
+  }, [documents, docFilterType, docFilterStatus, docSearchTerm]);
+
+  const docTotalPages = Math.max(1, Math.ceil(filteredDocRecords.length / docPageSize));
+  const paginatedDocRecords = useMemo(() => {
+    const start = (docPage - 1) * docPageSize;
+    return filteredDocRecords.slice(start, start + docPageSize);
+  }, [filteredDocRecords, docPage, docPageSize]);
+
+  useEffect(() => {
+    setDocPage(1);
+  }, [docSearchTerm, docFilterType, docFilterStatus, docPageSize]);
 
   // 5. Modales Operativos y Alertas de Confirmación Estricta
   const [showIntegrationModal, setShowIntegrationModal] = useState(false);
@@ -3842,10 +3877,10 @@ export function App() {
         {/* ================================================================== */}
         {activeTab === 'documentos' && (
           <div className="space-y-4">
-            <div className="flex items-center justify-between">
+            <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
               <div>
                 <h2 className="text-xl font-bold text-slate-900 flex items-center gap-2">
-                  <FileText className="w-6 h-6 text-indigo-600" /> Registro Oficial de Comprobantes
+                  <FileText className="w-6 h-6 text-indigo-600" /> Registro Oficial de Comprobantes ({filteredDocRecords.length})
                 </h2>
                 <p className="text-xs text-slate-500">Historial completo con CDR oficial, representación impresa y XML firmado</p>
               </div>
@@ -3858,6 +3893,46 @@ export function App() {
               </button>
             </div>
 
+            {/* BARRA DE FILTROS CCOFACT */}
+            <div className="bg-white border border-slate-200/80 rounded-2xl p-3.5 flex flex-wrap items-center justify-between gap-3 shadow-xs">
+              <div className="relative flex-1 min-w-[220px]">
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                <input
+                  type="text"
+                  placeholder="Buscar por número, RUC/DNI o cliente..."
+                  value={docSearchTerm}
+                  onChange={(e) => setDocSearchTerm(e.target.value)}
+                  className="w-full pl-9 pr-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:ring-2 focus:ring-indigo-500/20 outline-none font-medium"
+                />
+              </div>
+
+              <div className="flex items-center gap-2">
+                <select
+                  value={docFilterType}
+                  onChange={(e) => setDocFilterType(e.target.value)}
+                  className="text-xs bg-slate-50 border border-slate-200 rounded-xl px-2.5 py-1.5 font-bold text-slate-700 outline-none cursor-pointer"
+                >
+                  <option value="ALL">Todos los Tipos</option>
+                  <option value="01">Factura (01)</option>
+                  <option value="03">Boleta (03)</option>
+                  <option value="07">Nota de Crédito (07)</option>
+                  <option value="08">Nota de Débito (08)</option>
+                  <option value="09">Guía de Remisión (09)</option>
+                </select>
+
+                <select
+                  value={docFilterStatus}
+                  onChange={(e) => setDocFilterStatus(e.target.value)}
+                  className="text-xs bg-slate-50 border border-slate-200 rounded-xl px-2.5 py-1.5 font-bold text-slate-700 outline-none cursor-pointer"
+                >
+                  <option value="ALL">Todos los Estados</option>
+                  <option value="ACCEPTED">Aceptados (CDR 0)</option>
+                  <option value="ANULADO">Anulados (N/C)</option>
+                  <option value="REJECTED">Observados / En Cola</option>
+                </select>
+              </div>
+            </div>
+
             <div className="bg-white border border-slate-200/80 rounded-3xl overflow-hidden shadow-xs">
               <div className="overflow-x-auto">
                 <table className="w-full text-left text-xs">
@@ -3868,12 +3943,13 @@ export function App() {
                       <th className="py-3 px-4">Cliente / Receptor</th>
                       <th className="py-3 px-4">Fecha / Hora</th>
                       <th className="py-3 px-4 text-right">Total</th>
+                      <th className="py-3 px-4 text-center">Estado Comercial</th>
                       <th className="py-3 px-4 text-center">Estado SUNAT</th>
                       <th className="py-3 px-4 text-right">Acciones</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
-                    {documents.map(doc => (
+                    {paginatedDocRecords.map((doc: DocumentRecord) => (
                       <tr key={doc.id} className="hover:bg-slate-50/80 transition">
                         <td className="py-3 px-4 font-mono font-bold text-indigo-600">
                           {doc.full_number}
@@ -3891,6 +3967,19 @@ export function App() {
                         <td className="py-3 px-4 text-right font-mono font-bold text-slate-900">
                           {doc.currency === 'USD' ? '$' : 'S/'} {Number(doc.total_amount).toFixed(2)}
                         </td>
+                        {/* ESTADO COMERCIAL */}
+                        <td className="py-3 px-4 text-center">
+                          {doc.status === 'ANULADO' ? (
+                            <span className="text-[10px] font-black px-2 py-0.5 rounded-full bg-rose-50 text-rose-700 border border-rose-200 uppercase">
+                              Anulado
+                            </span>
+                          ) : (
+                            <span className="text-[10px] font-black px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 uppercase">
+                              Vigente
+                            </span>
+                          )}
+                        </td>
+                        {/* ESTADO SUNAT */}
                         <td className="py-3 px-4 text-center">
                           <button
                             type="button"
@@ -3898,7 +3987,7 @@ export function App() {
                             title="Haz clic para ver el Diagnóstico Tributario Oficial retornado por SUNAT"
                             className={`text-[10px] font-bold px-2.5 py-0.5 rounded-full cursor-pointer hover:opacity-85 transition inline-flex items-center gap-1 ${
                               doc.status === 'ANULADO'
-                                ? 'bg-rose-100 text-rose-800 border border-rose-300 font-extrabold line-through'
+                                ? 'bg-rose-100 text-rose-800 border border-rose-300 font-extrabold'
                                 : doc.status.includes('ACCEPTED')
                                 ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
                                 : doc.status === 'QUEUED'
@@ -3906,7 +3995,7 @@ export function App() {
                                 : 'bg-rose-50 text-rose-700 border border-rose-200'
                             }`}
                           >
-                            <span>{doc.status}</span>
+                            <span>{doc.status === 'ANULADO' ? 'Anulado (NC)' : doc.status}</span>
                             <Info className="w-2.5 h-2.5 opacity-60" />
                           </button>
                         </td>
@@ -4006,16 +4095,68 @@ export function App() {
                         </td>
                       </tr>
                     ))}
-                    {documents.length === 0 && (
+                    {filteredDocRecords.length === 0 && (
                       <tr>
-                        <td colSpan={7} className="py-12 text-center text-slate-400">
-                          No hay comprobantes registrados para este emisor.
+                        <td colSpan={8} className="py-12 text-center text-slate-400">
+                          No se encontraron comprobantes con los filtros seleccionados.
                         </td>
                       </tr>
                     )}
                   </tbody>
                 </table>
               </div>
+
+              {/* PAGINACIÓN DE COMPROBANTES */}
+              {filteredDocRecords.length > 0 && (
+                <div className="px-5 py-3.5 bg-slate-50 border-t border-slate-100 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs text-slate-600">
+                  <div className="flex items-center gap-2">
+                    <span>Mostrando</span>
+                    <span className="font-bold text-slate-900">
+                      {Math.min(filteredDocRecords.length, (docPage - 1) * docPageSize + 1)} -{" "}
+                      {Math.min(filteredDocRecords.length, docPage * docPageSize)}
+                    </span>
+                    <span>de</span>
+                    <span className="font-bold text-slate-900">{filteredDocRecords.length}</span>
+                    <span>registros</span>
+                    <span className="text-slate-300 mx-1">|</span>
+                    <div className="flex items-center gap-1.5">
+                      <span>Por pág:</span>
+                      <select
+                        value={docPageSize}
+                        onChange={(e) => setDocPageSize(Number(e.target.value))}
+                        className="bg-white border border-slate-200 rounded-lg px-2 py-1 font-bold text-slate-800 outline-none cursor-pointer"
+                      >
+                        <option value={10}>10</option>
+                        <option value={25}>25</option>
+                        <option value={50}>50</option>
+                        <option value={100}>100</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => setDocPage((p) => Math.max(1, p - 1))}
+                      disabled={docPage <= 1}
+                      className="px-3 py-1.5 rounded-lg border border-slate-200 bg-white font-bold text-slate-700 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed transition cursor-pointer"
+                    >
+                      &larr; Anterior
+                    </button>
+                    <span className="px-3 py-1.5 font-bold text-slate-900 bg-white border border-slate-200 rounded-lg">
+                      {docPage} / {docTotalPages}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setDocPage((p) => Math.min(docTotalPages, p + 1))}
+                      disabled={docPage >= docTotalPages}
+                      className="px-3 py-1.5 rounded-lg border border-slate-200 bg-white font-bold text-slate-700 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed transition cursor-pointer"
+                    >
+                      Siguiente &rarr;
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         )}
