@@ -363,12 +363,12 @@ export function App() {
   const [searchingRefDoc, setSearchingRefDoc] = useState(false);
   const [sunatConsultResult, setSunatConsultResult] = useState<any | null>(null);
 
-  // 9. Datos del Adquiriente / Cliente
+  // 9. Datos del Adquiriente / Cliente (Campos limpios con placeholders, sin datos falsos autocompletados)
   const [clientDocType, setClientDocType] = useState('6');
-  const [clientDocNumber, setClientDocNumber] = useState('20601234567');
-  const [clientName, setClientName] = useState('CORPORACION ANDINA DE SERVICIOS S.A.C.');
-  const [clientAddress, setClientAddress] = useState('Av. República de Panamá 3055, San Isidro, Lima');
-  const [clientEmail, setClientEmail] = useState('contacto@andina.com.pe');
+  const [clientDocNumber, setClientDocNumber] = useState('');
+  const [clientName, setClientName] = useState('');
+  const [clientAddress, setClientAddress] = useState('');
+  const [clientEmail, setClientEmail] = useState('');
   const [lookingUpDoc, setLookingUpDoc] = useState(false);
   const [clientSunatStatus, setClientSunatStatus] = useState<{ estado: string; condicion: string; ubigeo?: string } | null>(null);
 
@@ -414,12 +414,12 @@ export function App() {
   // 11. Líneas de Detalle / Ítems
   const [items, setItems] = useState<DocumentItem[]>([
     {
-      code: 'SERV-01',
-      description: 'Implementación de API de Facturación Electrónica SUNAT UBL 2.1',
-      unit_measure: 'ZZ',
+      code: '',
+      description: '',
+      unit_measure: 'NIU',
       quantity: 1,
-      unit_price: 1180.00,
-      igv_affectation_type: '10'
+      unit_price: 0,
+      igv_affectation_type: '20'
     }
   ]);
 
@@ -484,7 +484,7 @@ export function App() {
     updateDefaultSeries(newType);
 
     if (newType === '01') {
-      // Factura exige RUC (6)
+      // Factura exige estrictamente RUC (6) de 11 dígitos
       setClientDocType('6');
       if (clientDocNumber.length === 8) {
         setClientDocNumber('');
@@ -493,9 +493,13 @@ export function App() {
         setClientSunatStatus(null);
       }
     } else if (newType === '03') {
-      // Boleta permite DNI (1) o RUC (6) o Sin Documento (0)
-      if (clientDocType !== '1' && clientDocType !== '0' && clientDocType !== '6') {
-        setClientDocType('1');
+      // Boleta de Venta: por defecto DNI (1) de 8 dígitos
+      setClientDocType('1');
+      if (clientDocNumber.length === 11) {
+        setClientDocNumber('');
+        setClientName('');
+        setClientAddress('');
+        setClientSunatStatus(null);
       }
     } else if (newType === '07') {
       // Nota de Crédito: sincronizar serie y serie de referencia
@@ -504,7 +508,7 @@ export function App() {
       setRefSeries(refDocType === '01' ? 'F001' : 'B001');
       if (refDocType === '01') {
         setClientDocType('6');
-      } else if (clientDocType !== '1' && clientDocType !== '0' && clientDocType !== '6') {
+      } else {
         setClientDocType('1');
       }
     } else if (newType === '08') {
@@ -514,7 +518,7 @@ export function App() {
       setRefSeries(refDocType === '01' ? 'F001' : 'B001');
       if (refDocType === '01') {
         setClientDocType('6');
-      } else if (clientDocType !== '1' && clientDocType !== '0' && clientDocType !== '6') {
+      } else {
         setClientDocType('1');
       }
     } else if (newType === '09') {
@@ -3524,14 +3528,29 @@ export function App() {
                     <label className="block font-semibold text-slate-700 mb-1">Tipo de Documento</label>
                     <select
                       value={clientDocType}
-                      onChange={(e) => setClientDocType(e.target.value)}
-                      className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 font-semibold text-slate-900 outline-none"
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setClientDocType(val);
+                        if (val === '0') {
+                          setClientDocNumber('00000000');
+                          setClientName('CLIENTES VARIOS');
+                        } else if (clientDocNumber === '00000000') {
+                          setClientDocNumber('');
+                          setClientName('');
+                        }
+                      }}
+                      className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 font-semibold text-slate-900 outline-none cursor-pointer"
                     >
-                      <option value="6">6 - R.U.C.</option>
-                      <option value="1">1 - D.N.I.</option>
-                      <option value="4">4 - CARNET EXTRANJERÍA</option>
-                      <option value="7">7 - PASAPORTE</option>
-                      <option value="0">0 - SIN DOCUMENTO</option>
+                      {docType === '01' ? (
+                        <option value="6">6 - R.U.C. (11 dígitos - Obligatorio para Facturas)</option>
+                      ) : (
+                        <>
+                          <option value="1">1 - D.N.I. (8 dígitos)</option>
+                          <option value="0">0 - SIN DOCUMENTO (Clientes Varios)</option>
+                          <option value="4">4 - CARNET EXTRANJERÍA</option>
+                          <option value="7">7 - PASAPORTE</option>
+                        </>
+                      )}
                     </select>
                   </div>
 
@@ -3541,8 +3560,8 @@ export function App() {
                       <button
                         type="button"
                         onClick={() => handleLookupDoc()}
-                        disabled={lookingUpDoc}
-                        className="text-[11px] text-indigo-600 hover:text-indigo-800 font-bold flex items-center gap-1 cursor-pointer"
+                        disabled={lookingUpDoc || clientDocType === '0'}
+                        className="text-[11px] text-indigo-600 hover:text-indigo-800 font-bold flex items-center gap-1 cursor-pointer disabled:opacity-40"
                         title="Consultar y autocompletar razón social"
                       >
                         {lookingUpDoc ? <RotateCw className="w-3 h-3 animate-spin" /> : <Search className="w-3 h-3" />}
@@ -3552,6 +3571,8 @@ export function App() {
                     <input
                       type="text"
                       value={clientDocNumber}
+                      maxLength={clientDocType === '6' ? 11 : clientDocType === '1' ? 8 : 15}
+                      disabled={clientDocType === '0'}
                       onKeyDown={(e) => {
                         if (e.key === 'Enter') {
                           e.preventDefault();
@@ -3560,24 +3581,25 @@ export function App() {
                         }
                       }}
                       onChange={(e) => {
-                        const val = e.target.value.replace(/\D/g, '');
+                        const maxL = clientDocType === '6' ? 11 : clientDocType === '1' ? 8 : 15;
+                        const val = e.target.value.replace(/\D/g, '').slice(0, maxL);
                         setClientDocNumber(val);
-                        if (val.length === 11) {
-                          if (clientDocType !== '6') {
-                            setClientDocType('6');
-                          }
+                        if (val.length === 11 && clientDocType === '6') {
                           handleLookupDoc(val, '6');
-                        } else if (val.length === 8) {
-                          if (docType !== '01') {
-                            if (clientDocType !== '1') {
-                              setClientDocType('1');
-                            }
-                            handleLookupDoc(val, '1');
-                          }
+                        } else if (val.length === 8 && clientDocType === '1') {
+                          handleLookupDoc(val, '1');
                         }
                       }}
-                      placeholder={clientDocType === '6' ? "Ingresa RUC (11 dígitos)" : clientDocType === '1' ? "Ingresa DNI (8 dígitos)" : "Número de documento"}
-                      className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 font-mono text-sm text-slate-900 outline-none focus:border-indigo-600 focus:ring-2 focus:ring-indigo-100 transition"
+                      placeholder={
+                        clientDocType === '6'
+                          ? "ej. 20601234567 (11 dígitos)"
+                          : clientDocType === '1'
+                          ? "ej. 45678901 (8 dígitos)"
+                          : clientDocType === '0'
+                          ? "00000000 (Sin Documento)"
+                          : "Número de documento"
+                      }
+                      className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 font-mono text-sm text-slate-900 outline-none focus:border-indigo-600 focus:ring-2 focus:ring-indigo-100 transition disabled:bg-slate-100"
                       required={clientDocType !== '0'}
                     />
                   </div>
@@ -3599,6 +3621,7 @@ export function App() {
                       type="text"
                       value={clientName}
                       onChange={(e) => setClientName(e.target.value)}
+                      placeholder={clientDocType === '0' ? "CLIENTES VARIOS" : "ej. Juan Pérez o Razón Social"}
                       className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 text-sm text-slate-900 outline-none"
                       required={clientDocType !== '0'}
                     />
@@ -3612,6 +3635,7 @@ export function App() {
                       type="text"
                       value={clientAddress}
                       onChange={(e) => setClientAddress(e.target.value)}
+                      placeholder="ej. Jr. Billinghurst 123 (opcional)"
                       className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 text-slate-900 outline-none"
                     />
                   </div>
@@ -3621,6 +3645,7 @@ export function App() {
                       type="email"
                       value={clientEmail}
                       onChange={(e) => setClientEmail(e.target.value)}
+                      placeholder="ej. contacto@empresa.com (opcional)"
                       className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 text-slate-900 outline-none"
                     />
                   </div>
