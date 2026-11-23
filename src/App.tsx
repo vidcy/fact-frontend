@@ -36,6 +36,8 @@ import {
   Sparkles,
   Leaf,
   Eye,
+  Wand2,
+  FileSpreadsheet,
   X,
 } from 'lucide-react';
 import { IntegrationModal } from './components/IntegrationModal';
@@ -180,20 +182,91 @@ export function App() {
     onConfirm: () => {},
   });
 
-  // Modal Oficial de Anulación Fiscal SUNAT (Comunicación de Baja vs Nota de Crédito)
+  // Catálogos Oficiales SUNAT
+  const SUNAT_CAT_09 = [
+    { code: '01', desc: 'Anulación de la operación' },
+    { code: '02', desc: 'Anulación por error en el RUC' },
+    { code: '03', desc: 'Corrección por error en la descripción' },
+    { code: '04', desc: 'Descuento global' },
+    { code: '05', desc: 'Descuento por ítem' },
+    { code: '06', desc: 'Devolución total' },
+    { code: '07', desc: 'Devolución por ítem' },
+    { code: '08', desc: 'Bonificación' },
+    { code: '09', desc: 'Disminución en el valor' },
+    { code: '10', desc: 'Otros Conceptos' },
+    { code: '11', desc: 'Ajustes de operaciones de exportación' },
+    { code: '12', desc: 'Ajustes afectos al IVAP' },
+    { code: '13', desc: 'Corrección o rectificación de montos netos pendientes y cuotas' },
+  ];
+
+  const SUNAT_CAT_10 = [
+    { code: '01', desc: 'Intereses por mora' },
+    { code: '02', desc: 'Aumento en el valor' },
+    { code: '03', desc: 'Penalidades/ otros conceptos' },
+    { code: '11', desc: 'Ajustes de operaciones de exportación' },
+    { code: '12', desc: 'Ajustes afectos al IVAP' },
+  ];
+
+  // Modal Oficial de Anulación Fiscal SUNAT (Nota de Crédito Tipo 01 - Cero Bajas)
   const [fiscalAnnulModal, setFiscalAnnulModal] = useState<{
     isOpen: boolean;
     doc: DocumentRecord | null;
-    method: 'COMUNICACION_BAJA' | 'NOTA_CREDITO';
+    method: 'NOTA_CREDITO';
     deliveredToClient: boolean;
     motivo: string;
     loading: boolean;
   }>({
     isOpen: false,
     doc: null,
-    method: 'COMUNICACION_BAJA',
-    deliveredToClient: false,
-    motivo: 'ANULACION DE LA OPERACION',
+    method: 'NOTA_CREDITO',
+    deliveredToClient: true,
+    motivo: 'ANULACION DE LA OPERACION (MOTIVO 01)',
+    loading: false,
+  });
+
+  // Modal de Edición Inteligente (Diff Engine SUNAT)
+  const [smartEditModal, setSmartEditModal] = useState<{
+    isOpen: boolean;
+    doc: DocumentRecord | null;
+    clientDocType: string;
+    clientDocNumber: string;
+    clientName: string;
+    clientAddress: string;
+    clientEmail: string;
+    issueDate: string;
+    items: Array<{ name: string; quantity: number; price: number }>;
+    loading: boolean;
+  }>({
+    isOpen: false,
+    doc: null,
+    clientDocType: '1',
+    clientDocNumber: '',
+    clientName: '',
+    clientAddress: '',
+    clientEmail: '',
+    issueDate: '',
+    items: [],
+    loading: false,
+  });
+
+  // Modal de Emisión Manual de Nota (Catálogo 09 / 10 SUNAT)
+  const [manualNoteModal, setManualNoteModal] = useState<{
+    isOpen: boolean;
+    doc: DocumentRecord | null;
+    noteType: '07' | '08';
+    reasonCode: string;
+    reasonText: string;
+    amount: number;
+    issueDate: string;
+    loading: boolean;
+  }>({
+    isOpen: false,
+    doc: null,
+    noteType: '07',
+    reasonCode: '01',
+    reasonText: '',
+    amount: 0,
+    issueDate: '',
     loading: false,
   });
 
@@ -640,40 +713,7 @@ export function App() {
     }
   };
 
-  // Selección manual de comprobante de referencia con autocompletado total
-  const handleSelectReferenceDoc = (docId: string) => {
-    if (!docId) {
-      setLinkedRefDoc(null);
-      setSunatConsultResult(null);
-      return;
-    }
 
-    const found = documents.find(d => d.id === docId);
-    if (!found) return;
-
-    const refType = (found.document_type === '01' ? '01' : '03') as '01' | '03';
-    populateFromDoc(found, refType);
-    setSunatConsultResult({
-      success: true,
-      official_status: 'ACEPTADO',
-      document_type: found.document_type,
-      series: found.series,
-      number: found.number,
-      full_number: found.full_number,
-      sunat_response_code: found.sunat_response_code || '0',
-      sunat_description: found.sunat_description || 'Comprobante verificado con CDR Oficial.',
-      sunat_notes: found.sunat_notes || [],
-      cdr_xml: found.cdr_xml || null,
-      document: found,
-    });
-  };
-
-  // Cargar comprobante directamente desde la tabla de documentos para emitir Nota de Crédito
-  const prefillCreditNoteFromDoc = (doc: DocumentRecord) => {
-    setDocType('07');
-    handleSelectReferenceDoc(doc.id);
-    setActiveTab('emitir');
-  };
 
   // Enviar JSON de prueba en la consola sandbox de CCOFACT PRO
   const handleSendSandboxJson = async () => {
@@ -1564,16 +1604,13 @@ export function App() {
       return;
     }
 
-    const issueDateObj = new Date(doc.issue_date);
-    const daysElapsed = Math.max(0, Math.floor((Date.now() - issueDateObj.getTime()) / (1000 * 60 * 60 * 24)));
-    const isWithin7Days = daysElapsed <= 7;
-
+    // Normativa SUNAT UBL 2.1 (CERO BAJAS): Todo comprobante aceptado se anula con Nota de Crédito Tipo 01
     setFiscalAnnulModal({
       isOpen: true,
       doc,
-      method: isWithin7Days ? 'COMUNICACION_BAJA' : 'NOTA_CREDITO',
-      deliveredToClient: false,
-      motivo: 'ANULACION DE LA OPERACION',
+      method: 'NOTA_CREDITO',
+      deliveredToClient: true,
+      motivo: 'ANULACION DE LA OPERACION (MOTIVO 01)',
       loading: false,
     });
   };
@@ -1584,9 +1621,7 @@ export function App() {
     const doc = fiscalAnnulModal.doc;
 
     try {
-      const endpoint = fiscalAnnulModal.method === 'COMUNICACION_BAJA'
-        ? `${API_BASE}/documents/${doc.id}/comunicacion-baja`
-        : `${API_BASE}/documents/${doc.id}/anular-fiscal`;
+      const endpoint = `${API_BASE}/documents/${doc.id}/anular-fiscal`;
 
       const res = await fetch(endpoint, {
         method: 'POST',
@@ -1607,7 +1642,7 @@ export function App() {
 
       setFeedbackAlert({
         type: 'success',
-        message: `ÉXITO: ${data.message || 'Comprobante procesado exitosamente.'}`
+        message: `ÉXITO: ${data.message || 'Comprobante anulado formalmente con Nota de Crédito ante SUNAT.'}`
       });
 
       setFiscalAnnulModal(prev => ({ ...prev, isOpen: false, doc: null, loading: false }));
@@ -1619,6 +1654,145 @@ export function App() {
         message: `ERROR: ${err.message}`
       });
       setFiscalAnnulModal(prev => ({ ...prev, loading: false }));
+    }
+  };
+
+  // Edición Inteligente con Diff Engine (SUNAT UBL 2.1)
+  const handleOpenSmartEdit = (doc: DocumentRecord) => {
+    let itemsArr: Array<{ name: string; quantity: number; price: number }> = [];
+    if (doc.items && Array.isArray(doc.items)) {
+      itemsArr = doc.items.map((it: any) => ({
+        name: it.description || it.name || 'Ítem',
+        quantity: Number(it.quantity) || 1,
+        price: Number(it.unit_price || it.price) || 0,
+      }));
+    } else {
+      itemsArr = [
+        {
+          name: `Servicio / Venta ${doc.full_number}`,
+          quantity: 1,
+          price: Number(doc.total_amount) || 0,
+        },
+      ];
+    }
+
+    setSmartEditModal({
+      isOpen: true,
+      doc,
+      clientDocType: doc.client_doc_type || '1',
+      clientDocNumber: doc.client_doc_number || '',
+      clientName: doc.client_name || '',
+      clientAddress: doc.client_address || '',
+      clientEmail: doc.client_email || '',
+      issueDate: doc.issue_date ? doc.issue_date.split('T')[0] : new Date().toISOString().split('T')[0],
+      items: itemsArr,
+      loading: false,
+    });
+  };
+
+  const handleConfirmSmartEdit = async () => {
+    if (!currentCompany || !smartEditModal.doc) return;
+    setSmartEditModal(prev => ({ ...prev, loading: true }));
+    const doc = smartEditModal.doc;
+
+    try {
+      const res = await fetch(`${API_BASE}/documents/${doc.id}/smart-edit`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': currentCompany.api_key,
+        },
+        body: JSON.stringify({
+          client_doc_type: smartEditModal.clientDocType,
+          client_doc_number: smartEditModal.clientDocNumber,
+          client_name: smartEditModal.clientName,
+          client_address: smartEditModal.clientAddress,
+          client_email: smartEditModal.clientEmail,
+          issue_date: smartEditModal.issueDate,
+          items: smartEditModal.items.map(it => ({
+            name: it.name,
+            quantity: Number(it.quantity),
+            price: Number(it.price),
+          })),
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.message || 'Error al procesar edición inteligente con Diff Engine');
+      }
+
+      setFeedbackAlert({
+        type: 'success',
+        message: `ÉXITO (${data.caso}): ${data.mensaje || 'Comprobante y notas procesados correctamente.'}`,
+      });
+
+      setSmartEditModal(prev => ({ ...prev, isOpen: false, doc: null, loading: false }));
+      await fetchDocuments();
+      await fetchQueueStats();
+    } catch (err: any) {
+      setFeedbackAlert({
+        type: 'error',
+        message: `ERROR: ${err.message}`,
+      });
+      setSmartEditModal(prev => ({ ...prev, loading: false }));
+    }
+  };
+
+  // Emisión Manual de Nota (Catálogo 09 / 10)
+  const handleOpenManualNote = (doc: DocumentRecord) => {
+    setManualNoteModal({
+      isOpen: true,
+      doc,
+      noteType: '07',
+      reasonCode: '01',
+      reasonText: '',
+      amount: Number(doc.total_amount),
+      issueDate: new Date().toISOString().split('T')[0],
+      loading: false,
+    });
+  };
+
+  const handleConfirmManualNote = async () => {
+    if (!currentCompany || !manualNoteModal.doc) return;
+    setManualNoteModal(prev => ({ ...prev, loading: true }));
+    const doc = manualNoteModal.doc;
+
+    try {
+      const res = await fetch(`${API_BASE}/documents/${doc.id}/manual-note`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': currentCompany.api_key,
+        },
+        body: JSON.stringify({
+          note_type: manualNoteModal.noteType,
+          reason_code: manualNoteModal.reasonCode,
+          reason_text: manualNoteModal.reasonText,
+          amount: Number(manualNoteModal.amount),
+          issue_date: manualNoteModal.issueDate,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.message || 'Error al emitir nota oficial');
+      }
+
+      setFeedbackAlert({
+        type: 'success',
+        message: `ÉXITO: Nota ${data.nota?.full_number || ''} emitida correctamente ante SUNAT.`,
+      });
+
+      setManualNoteModal(prev => ({ ...prev, isOpen: false, doc: null, loading: false }));
+      await fetchDocuments();
+      await fetchQueueStats();
+    } catch (err: any) {
+      setFeedbackAlert({
+        type: 'error',
+        message: `ERROR: ${err.message}`,
+      });
+      setManualNoteModal(prev => ({ ...prev, loading: false }));
     }
   };
 
@@ -3787,19 +3961,28 @@ export function App() {
                             )}
 
                             {doc.status.includes('ACCEPTED') && doc.status !== 'ANULADO' && (doc.document_type === '01' || doc.document_type === '03') && (
-                              <button
-                                onClick={() => prefillCreditNoteFromDoc(doc)}
-                                className="p-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-lg transition cursor-pointer"
-                                title="Emitir Nota de Crédito personalizada para este comprobante"
-                              >
-                                <FileText className="w-3.5 h-3.5" />
-                              </button>
+                              <>
+                                <button
+                                  onClick={() => handleOpenSmartEdit(doc)}
+                                  className="p-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-lg transition cursor-pointer"
+                                  title="Edición Inteligente con Diff Engine (SUNAT UBL 2.1) - Detección automática de Casos A, B, C y D"
+                                >
+                                  <Wand2 className="w-3.5 h-3.5" />
+                                </button>
+                                <button
+                                  onClick={() => handleOpenManualNote(doc)}
+                                  className="p-1.5 bg-purple-50 hover:bg-purple-100 text-purple-700 rounded-lg transition cursor-pointer"
+                                  title="Emisión Manual de Nota de Crédito o Débito (Catálogo 09 y 10 SUNAT)"
+                                >
+                                  <FileSpreadsheet className="w-3.5 h-3.5" />
+                                </button>
+                              </>
                             )}
 
                             {doc.status.includes('ACCEPTED') && doc.status !== 'ANULADO' && (
                               <button
                                 onClick={() => handleAnularDocument(doc)}
-                                className="p-1.5 bg-amber-50 hover:bg-amber-100 text-amber-700 rounded-lg transition cursor-pointer"
+                                className="p-1.5 bg-rose-50 hover:bg-rose-100 text-rose-700 rounded-lg transition cursor-pointer"
                                 title="Anulación Formal Directa ante SUNAT (Emite Nota de Crédito Motivo 01)"
                               >
                                 <Ban className="w-3.5 h-3.5" />
@@ -5017,17 +5200,14 @@ Idempotency-Key: cco_order_987654 (Opcional pero recomendado para cero duplicado
         onCancel={() => setConfirmConfig(prev => ({ ...prev, isOpen: false }))}
       />
 
-      {/* MODAL OFICIAL DE ANULACIÓN SUNAT (COMUNICACIÓN DE BAJA VS NOTA DE CRÉDITO) */}
+      {/* MODAL OFICIAL DE ANULACIÓN SUNAT (NOTA DE CRÉDITO TIPO 01 - CERO BAJAS) */}
       {fiscalAnnulModal.isOpen && fiscalAnnulModal.doc && (() => {
         const doc = fiscalAnnulModal.doc;
-        const issueDateObj = new Date(doc.issue_date);
-        const daysElapsed = Math.max(0, Math.floor((Date.now() - issueDateObj.getTime()) / (1000 * 60 * 60 * 24)));
-        const isWithin7Days = daysElapsed <= 7;
         const isFactura = doc.document_type === '01';
 
         return (
           <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-200">
-            <div className="bg-white rounded-2xl shadow-2xl max-w-xl w-full border border-slate-200 overflow-hidden">
+            <div className="bg-white rounded-2xl shadow-2xl max-w-lg w-full border border-slate-200 overflow-hidden">
               {/* Header */}
               <div className="p-5 flex items-start gap-4 border-b border-rose-100 bg-rose-50/40">
                 <div className="w-12 h-12 rounded-xl flex items-center justify-center shrink-0 bg-rose-100 ring-4 ring-rose-50 text-rose-600">
@@ -5035,10 +5215,10 @@ Idempotency-Key: cco_order_987654 (Opcional pero recomendado para cero duplicado
                 </div>
                 <div className="flex-1 min-w-0">
                   <span className="inline-block px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider rounded border border-rose-200 bg-rose-50 text-rose-700 mb-1">
-                    ANULACIÓN OFICIAL SUNAT &bull; UBL 2.1
+                    ANULACIÓN TRIBUTARIA SUNAT &bull; UBL 2.1
                   </span>
                   <h3 className="text-lg font-bold text-slate-900 leading-snug">
-                    Anular Comprobante {doc.full_number}
+                    Anular {doc.full_number}
                   </h3>
                   <p className="text-xs text-slate-500 font-medium">
                     Cliente: <strong>{doc.client_name}</strong> &bull; Total: <strong>S/ {Number(doc.total_amount).toFixed(2)}</strong>
@@ -5056,118 +5236,23 @@ Idempotency-Key: cco_order_987654 (Opcional pero recomendado para cero duplicado
 
               {/* Body */}
               <div className="p-5 space-y-4 max-h-[70vh] overflow-y-auto">
-                {/* Diagnóstico de Días */}
-                <div className="flex flex-wrap items-center justify-between gap-2 p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs">
-                  <div className="flex items-center gap-1.5 font-bold text-slate-700">
-                    <Clock className="w-4 h-4 text-indigo-600" />
-                    <span>Emitido hace: <strong className="text-slate-900">{daysElapsed} {daysElapsed === 1 ? 'día' : 'días'}</strong></span>
-                  </div>
-                  {isWithin7Days ? (
-                    <span className="px-2 py-0.5 rounded-full text-[10px] font-black bg-emerald-100 text-emerald-800 border border-emerald-300">
-                      ✓ Dentro de los 7 días calendario
-                    </span>
-                  ) : (
-                    <span className="px-2 py-0.5 rounded-full text-[10px] font-black bg-amber-100 text-amber-800 border border-amber-300">
-                      ⚠ Superó los 7 días calendario
-                    </span>
-                  )}
-                </div>
-
-                {/* Pregunta Clave: ¿Entregado al cliente? */}
-                <div className="p-3 bg-white border border-slate-200 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
-                  <div>
-                    <p className="text-xs font-black text-slate-800">¿El comprobante ya fue entregado al cliente?</p>
-                    <p className="text-[10px] text-slate-500">SUNAT: Si el adquirente ya lo tiene, se debe emitir Nota de Crédito.</p>
-                  </div>
-                  <div className="flex items-center gap-1.5 bg-slate-100 p-1 rounded-xl shrink-0">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setFiscalAnnulModal(prev => ({
-                          ...prev,
-                          deliveredToClient: false,
-                          method: isWithin7Days ? 'COMUNICACION_BAJA' : 'NOTA_CREDITO',
-                        }));
-                      }}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-black transition-all ${
-                        !fiscalAnnulModal.deliveredToClient
-                          ? 'bg-white text-slate-900 shadow-sm border border-slate-200'
-                          : 'text-slate-500 hover:text-slate-800'
-                      }`}
-                    >
-                      No entregado
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setFiscalAnnulModal(prev => ({
-                          ...prev,
-                          deliveredToClient: true,
-                          method: 'NOTA_CREDITO',
-                        }));
-                      }}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-black transition-all ${
-                        fiscalAnnulModal.deliveredToClient
-                          ? 'bg-blue-600 text-white shadow-sm'
-                          : 'text-slate-500 hover:text-slate-800'
-                      }`}
-                    >
-                      Ya entregado
-                    </button>
-                  </div>
-                </div>
-
-                {/* Selección de Método */}
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div
-                    onClick={() => setFiscalAnnulModal(prev => ({ ...prev, method: 'COMUNICACION_BAJA' }))}
-                    className={`p-3 rounded-xl border-2 transition-all cursor-pointer ${
-                      fiscalAnnulModal.method === 'COMUNICACION_BAJA'
-                        ? 'border-emerald-500 bg-emerald-50/40 ring-2 ring-emerald-400/20 shadow-sm'
-                        : 'border-slate-200 hover:border-slate-300 bg-white'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between mb-1">
-                      <span className="text-xs font-black text-slate-900">1. Comunicación de Baja</span>
-                      {isWithin7Days && !fiscalAnnulModal.deliveredToClient && (
-                        <span className="text-[9px] font-black bg-emerald-600 text-white px-1.5 py-0.5 rounded">Recomendado</span>
-                      )}
-                    </div>
-                    <p className="text-[10px] text-slate-600 leading-tight">
-                      Aviso directo a SUNAT. Anula el comprobante sin gastar series de Nota de Crédito.
-                    </p>
-                  </div>
-
-                  <div
-                    onClick={() => setFiscalAnnulModal(prev => ({ ...prev, method: 'NOTA_CREDITO' }))}
-                    className={`p-3 rounded-xl border-2 transition-all cursor-pointer ${
-                      fiscalAnnulModal.method === 'NOTA_CREDITO'
-                        ? 'border-blue-500 bg-blue-50/40 ring-2 ring-blue-400/20 shadow-sm'
-                        : 'border-slate-200 hover:border-slate-300 bg-white'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between mb-1">
-                      <span className="text-xs font-black text-slate-900">2. Nota de Crédito</span>
-                      {(!isWithin7Days || fiscalAnnulModal.deliveredToClient) && (
-                        <span className="text-[9px] font-black bg-blue-600 text-white px-1.5 py-0.5 rounded">Requerido</span>
-                      )}
-                    </div>
-                    <p className="text-[10px] text-slate-600 leading-tight">
-                      Emite {isFactura ? 'FC01' : 'BC01'} oficial firmada con certificado digital ante SUNAT.
-                    </p>
-                  </div>
+                <div className="p-3.5 bg-blue-50/60 border border-blue-200 rounded-xl text-xs space-y-1.5">
+                  <span className="font-black text-blue-900 block">Normativa SUNAT Vigente:</span>
+                  <p className="text-slate-700 leading-relaxed font-medium">
+                    El comprobante se anulará formalmente emitiendo una <strong>Nota de Crédito Electrónica ({isFactura ? 'FC01' : 'BC01'})</strong> bajo el Catálogo 09 Motivo 01 (Anulación de la operación).
+                  </p>
                 </div>
 
                 {/* Motivo de Anulación */}
                 <div>
                   <label className="block text-[11px] font-bold text-slate-600 uppercase mb-1">
-                    Motivo de la Anulación:
+                    Sustento del Motivo ante SUNAT:
                   </label>
                   <input
                     type="text"
                     value={fiscalAnnulModal.motivo}
                     onChange={(e) => setFiscalAnnulModal(prev => ({ ...prev, motivo: e.target.value }))}
-                    className="w-full px-3 py-2 text-xs border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-slate-400"
+                    className="w-full px-3.5 py-2.5 text-xs border border-slate-300 rounded-xl outline-none focus:ring-2 focus:ring-rose-500 font-medium"
                   />
                 </div>
               </div>
@@ -5186,19 +5271,330 @@ Idempotency-Key: cco_order_987654 (Opcional pero recomendado para cero duplicado
                   type="button"
                   onClick={handleConfirmFiscalAnnulment}
                   disabled={fiscalAnnulModal.loading}
-                  className={`px-5 py-2 text-xs font-bold text-white rounded-xl shadow-md transition disabled:opacity-50 flex items-center gap-1.5 ${
-                    fiscalAnnulModal.method === 'COMUNICACION_BAJA'
-                      ? 'bg-emerald-600 hover:bg-emerald-700 shadow-emerald-600/20'
-                      : 'bg-rose-600 hover:bg-rose-700 shadow-rose-600/20'
-                  }`}
+                  className="px-5 py-2.5 text-xs font-bold text-white bg-rose-600 hover:bg-rose-700 shadow-md shadow-rose-600/20 rounded-xl transition disabled:opacity-50 flex items-center gap-1.5"
                 >
-                  {fiscalAnnulModal.loading ? 'Procesando ante SUNAT...' : fiscalAnnulModal.method === 'COMUNICACION_BAJA' ? 'Confirmar Baja Directa' : 'Emitir Nota de Crédito'}
+                  {fiscalAnnulModal.loading ? 'Emitiendo Nota en SUNAT...' : 'Emitir Nota de Crédito Oficial'}
                 </button>
               </div>
             </div>
           </div>
         );
       })()}
+
+      {/* MODAL INTELIGENTE: EDICIÓN CON DIFF ENGINE (SUNAT UBL 2.1) */}
+      {smartEditModal.isOpen && smartEditModal.doc && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-200">
+          <div className="bg-white rounded-2xl shadow-2xl max-w-2xl w-full border border-slate-200 overflow-hidden">
+            {/* Header */}
+            <div className="p-5 flex items-start gap-4 border-b border-indigo-100 bg-indigo-50/40">
+              <div className="w-12 h-12 rounded-xl flex items-center justify-center shrink-0 bg-indigo-600 text-white shadow-md shadow-indigo-600/20">
+                <Wand2 className="w-6 h-6" />
+              </div>
+              <div className="flex-1 min-w-0">
+                <span className="inline-block px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider rounded border border-indigo-200 bg-indigo-50 text-indigo-700 mb-1">
+                  DIFF ENGINE INTELIGENTE &bull; SUNAT UBL 2.1
+                </span>
+                <h3 className="text-lg font-bold text-slate-900 leading-snug">
+                  Edición Inteligente de {smartEditModal.doc.full_number}
+                </h3>
+                <p className="text-xs text-slate-500 font-medium">
+                  El motor detectará si corresponde Caso A (Anulación + Reemisión), Caso B (NC Descuento/Devolución), Caso C (ND Aumento) o Caso D (Descripción).
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSmartEditModal(prev => ({ ...prev, isOpen: false, doc: null }))}
+                disabled={smartEditModal.loading}
+                className="p-1 text-slate-400 hover:text-slate-600 rounded-lg hover:bg-slate-100 transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Form */}
+            <div className="p-5 space-y-4 max-h-[70vh] overflow-y-auto">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 bg-slate-50 p-3.5 rounded-xl border border-slate-200">
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-600 mb-1">Tipo Doc.</label>
+                  <select
+                    value={smartEditModal.clientDocType}
+                    onChange={(e) => setSmartEditModal(prev => ({ ...prev, clientDocType: e.target.value }))}
+                    className="w-full text-xs font-bold bg-white border border-slate-200 rounded-lg p-2"
+                  >
+                    <option value="1">1 - DNI</option>
+                    <option value="6">6 - RUC</option>
+                    <option value="4">4 - CARNET EXT.</option>
+                    <option value="7">7 - PASAPORTE</option>
+                    <option value="0">0 - SIN DOC.</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-600 mb-1">N° Documento</label>
+                  <input
+                    type="text"
+                    value={smartEditModal.clientDocNumber}
+                    onChange={(e) => setSmartEditModal(prev => ({ ...prev, clientDocNumber: e.target.value }))}
+                    className="w-full text-xs font-mono font-bold bg-white border border-slate-200 rounded-lg p-2"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-600 mb-1">Fecha Emisión</label>
+                  <input
+                    type="date"
+                    value={smartEditModal.issueDate}
+                    onChange={(e) => setSmartEditModal(prev => ({ ...prev, issueDate: e.target.value }))}
+                    className="w-full text-xs font-mono font-bold bg-white border border-slate-200 rounded-lg p-2"
+                  />
+                </div>
+                <div className="sm:col-span-3">
+                  <label className="block text-[11px] font-bold text-slate-600 mb-1">Razón Social / Nombre</label>
+                  <input
+                    type="text"
+                    value={smartEditModal.clientName}
+                    onChange={(e) => setSmartEditModal(prev => ({ ...prev, clientName: e.target.value }))}
+                    className="w-full text-xs font-bold bg-white border border-slate-200 rounded-lg p-2"
+                  />
+                </div>
+              </div>
+
+              {/* Items */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <h4 className="text-xs font-black text-slate-700 uppercase">Detalle de Ítems</h4>
+                  <button
+                    type="button"
+                    onClick={() => setSmartEditModal(prev => ({
+                      ...prev,
+                      items: [...prev.items, { name: '', quantity: 1, price: 0 }]
+                    }))}
+                    className="px-2.5 py-1 text-xs font-bold text-indigo-600 hover:bg-indigo-50 border border-indigo-200 rounded-lg flex items-center gap-1"
+                  >
+                    <Plus className="w-3.5 h-3.5" /> Agregar
+                  </button>
+                </div>
+
+                <div className="border border-slate-200 rounded-xl overflow-hidden">
+                  <table className="w-full text-xs text-left">
+                    <thead className="bg-slate-50 text-[10px] text-slate-500 font-bold uppercase border-b border-slate-200">
+                      <tr>
+                        <th className="py-2 px-3">Descripción</th>
+                        <th className="py-2 px-3 w-20 text-center">Cant.</th>
+                        <th className="py-2 px-3 w-24 text-right">Precio</th>
+                        <th className="py-2 px-3 w-8"></th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {smartEditModal.items.map((it, idx) => (
+                        <tr key={idx}>
+                          <td className="py-1.5 px-3">
+                            <input
+                              type="text"
+                              value={it.name}
+                              onChange={(e) => {
+                                const next = [...smartEditModal.items];
+                                next[idx].name = e.target.value;
+                                setSmartEditModal(prev => ({ ...prev, items: next }));
+                              }}
+                              className="w-full text-xs bg-transparent border-b border-transparent focus:border-indigo-500 outline-none"
+                            />
+                          </td>
+                          <td className="py-1.5 px-3">
+                            <input
+                              type="number"
+                              step="0.01"
+                              value={it.quantity}
+                              onChange={(e) => {
+                                const next = [...smartEditModal.items];
+                                next[idx].quantity = parseFloat(e.target.value) || 0;
+                                setSmartEditModal(prev => ({ ...prev, items: next }));
+                              }}
+                              className="w-full text-xs text-center font-bold bg-white border border-slate-200 rounded py-0.5"
+                            />
+                          </td>
+                          <td className="py-1.5 px-3">
+                            <input
+                              type="number"
+                              step="0.01"
+                              value={it.price}
+                              onChange={(e) => {
+                                const next = [...smartEditModal.items];
+                                next[idx].price = parseFloat(e.target.value) || 0;
+                                setSmartEditModal(prev => ({ ...prev, items: next }));
+                              }}
+                              className="w-full text-xs text-right font-bold bg-white border border-slate-200 rounded py-0.5"
+                            />
+                          </td>
+                          <td className="py-1.5 px-3 text-center">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                if (smartEditModal.items.length <= 1) return;
+                                setSmartEditModal(prev => ({ ...prev, items: prev.items.filter((_, i) => i !== idx) }));
+                              }}
+                              className="text-slate-400 hover:text-rose-600"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+
+            {/* Footer */}
+            <div className="p-4 bg-slate-50 border-t border-slate-200 flex justify-end gap-2.5">
+              <button
+                type="button"
+                onClick={() => setSmartEditModal(prev => ({ ...prev, isOpen: false, doc: null }))}
+                disabled={smartEditModal.loading}
+                className="px-4 py-2 text-xs font-bold text-slate-600 hover:text-slate-800 transition"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmSmartEdit}
+                disabled={smartEditModal.loading}
+                className="px-5 py-2.5 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 shadow-md shadow-indigo-600/20 rounded-xl transition disabled:opacity-50 flex items-center gap-1.5"
+              >
+                {smartEditModal.loading ? 'Procesando Diff Engine...' : 'Ejecutar Edición Inteligente'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL AVANZADO: EMISIÓN MANUAL DE NOTA (CATÁLOGO 09 Y 10 SUNAT) */}
+      {manualNoteModal.isOpen && manualNoteModal.doc && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-200">
+          <div className="bg-white rounded-2xl shadow-2xl max-w-lg w-full border border-slate-200 overflow-hidden">
+            {/* Header */}
+            <div className="p-5 flex items-start gap-4 border-b border-purple-100 bg-purple-50/40">
+              <div className="w-12 h-12 rounded-xl flex items-center justify-center shrink-0 bg-purple-600 text-white shadow-md shadow-purple-600/20">
+                <FileSpreadsheet className="w-6 h-6" />
+              </div>
+              <div className="flex-1 min-w-0">
+                <span className="inline-block px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider rounded border border-purple-200 bg-purple-50 text-purple-700 mb-1">
+                  EMISIÓN MANUAL DE NOTA &bull; MODO CONTADOR
+                </span>
+                <h3 className="text-lg font-bold text-slate-900 leading-snug">
+                  Nota para {manualNoteModal.doc.full_number}
+                </h3>
+                <p className="text-xs text-slate-500 font-medium">
+                  Comprobante base: {manualNoteModal.doc.full_number} &bull; Total: S/ {Number(manualNoteModal.doc.total_amount).toFixed(2)}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setManualNoteModal(prev => ({ ...prev, isOpen: false, doc: null }))}
+                disabled={manualNoteModal.loading}
+                className="p-1 text-slate-400 hover:text-slate-600 rounded-lg hover:bg-slate-100 transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Form */}
+            <div className="p-5 space-y-4 max-h-[70vh] overflow-y-auto">
+              <div className="grid grid-cols-2 gap-2 p-1 bg-slate-100 rounded-xl">
+                <button
+                  type="button"
+                  onClick={() => setManualNoteModal(prev => ({ ...prev, noteType: '07', reasonCode: '01' }))}
+                  className={`py-2 text-xs font-black rounded-lg transition ${
+                    manualNoteModal.noteType === '07' ? 'bg-white text-rose-600 shadow-sm' : 'text-slate-500'
+                  }`}
+                >
+                  Nota de Crédito (Tipo 07)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setManualNoteModal(prev => ({ ...prev, noteType: '08', reasonCode: '02' }))}
+                  className={`py-2 text-xs font-black rounded-lg transition ${
+                    manualNoteModal.noteType === '08' ? 'bg-white text-purple-600 shadow-sm' : 'text-slate-500'
+                  }`}
+                >
+                  Nota de Débito (Tipo 08)
+                </button>
+              </div>
+
+              <div>
+                <label className="block text-[11px] font-bold text-slate-600 uppercase mb-1">
+                  Motivo Oficial ({manualNoteModal.noteType === '07' ? 'Catálogo 09 SUNAT' : 'Catálogo 10 SUNAT'}):
+                </label>
+                <select
+                  value={manualNoteModal.reasonCode}
+                  onChange={(e) => setManualNoteModal(prev => ({ ...prev, reasonCode: e.target.value }))}
+                  className="w-full text-xs font-bold bg-white border border-slate-300 rounded-xl p-2.5 outline-none focus:ring-2 focus:ring-purple-500"
+                >
+                  {(manualNoteModal.noteType === '07' ? SUNAT_CAT_09 : SUNAT_CAT_10).map(r => (
+                    <option key={r.code} value={r.code}>
+                      {r.code} - {r.desc}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-[11px] font-bold text-slate-600 uppercase mb-1">
+                  Sustento Detallado (XML SUNAT):
+                </label>
+                <input
+                  type="text"
+                  value={manualNoteModal.reasonText}
+                  onChange={(e) => setManualNoteModal(prev => ({ ...prev, reasonText: e.target.value }))}
+                  placeholder="Sustento tributario del motivo..."
+                  className="w-full px-3.5 py-2.5 text-xs border border-slate-300 rounded-xl outline-none focus:ring-2 focus:ring-purple-500 font-medium"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3 bg-slate-50 p-3 rounded-xl border border-slate-200">
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-600 mb-1">Importe Nota (S/)</label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    value={manualNoteModal.amount}
+                    onChange={(e) => setManualNoteModal(prev => ({ ...prev, amount: parseFloat(e.target.value) || 0 }))}
+                    className="w-full text-xs font-mono font-bold bg-white border border-slate-200 rounded-lg p-2"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-600 mb-1">Fecha Emisión</label>
+                  <input
+                    type="date"
+                    value={manualNoteModal.issueDate}
+                    onChange={(e) => setManualNoteModal(prev => ({ ...prev, issueDate: e.target.value }))}
+                    className="w-full text-xs font-mono font-bold bg-white border border-slate-200 rounded-lg p-2"
+                  />
+                </div>
+              </div>
+            </div>
+
+            {/* Footer */}
+            <div className="p-4 bg-slate-50 border-t border-slate-200 flex justify-end gap-2.5">
+              <button
+                type="button"
+                onClick={() => setManualNoteModal(prev => ({ ...prev, isOpen: false, doc: null }))}
+                disabled={manualNoteModal.loading}
+                className="px-4 py-2 text-xs font-bold text-slate-600 hover:text-slate-800 transition"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmManualNote}
+                disabled={manualNoteModal.loading}
+                className="px-5 py-2.5 text-xs font-bold text-white bg-purple-600 hover:bg-purple-700 shadow-md shadow-purple-600/20 rounded-xl transition disabled:opacity-50 flex items-center gap-1.5"
+              >
+                {manualNoteModal.loading ? 'Emitiendo en SUNAT...' : 'Emitir Nota Oficial'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* NOTIFICACIÓN / ALERTA VISUAL ELEGANTE (SIN ALERT DE NAVEGADOR) */}
       {feedbackAlert && (
