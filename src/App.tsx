@@ -36,6 +36,7 @@ import {
   Sparkles,
   Leaf,
   Eye,
+  X,
 } from 'lucide-react';
 import { IntegrationModal } from './components/IntegrationModal';
 import { CompanyFormModal } from './components/CompanyFormModal';
@@ -177,6 +178,23 @@ export function App() {
     title: '',
     message: '',
     onConfirm: () => {},
+  });
+
+  // Modal Oficial de Anulación Fiscal SUNAT (Comunicación de Baja vs Nota de Crédito)
+  const [fiscalAnnulModal, setFiscalAnnulModal] = useState<{
+    isOpen: boolean;
+    doc: DocumentRecord | null;
+    method: 'COMUNICACION_BAJA' | 'NOTA_CREDITO';
+    deliveredToClient: boolean;
+    motivo: string;
+    loading: boolean;
+  }>({
+    isOpen: false,
+    doc: null,
+    method: 'COMUNICACION_BAJA',
+    deliveredToClient: false,
+    motivo: 'ANULACION DE LA OPERACION',
+    loading: false,
   });
 
   const [feedbackAlert, setFeedbackAlert] = useState<{
@@ -1484,7 +1502,7 @@ export function App() {
     }
   };
 
-  // Anulación fiscal conforme a Ley SUNAT (Emite Nota de Crédito) o descarte local
+  // Anulación fiscal oficial SUNAT: Comunicación de Baja (≤ 7 días) vs Nota de Crédito (Tipo 01)
   const handleAnularDocument = (doc: DocumentRecord) => {
     if (!currentCompany) return;
 
@@ -1498,74 +1516,103 @@ export function App() {
 
     const isAcceptedBySunat = doc.status.includes('ACCEPTED');
 
-    setConfirmConfig({
-      isOpen: true,
-      title: isAcceptedBySunat ? 'Anulación Legal Obligatoria ante SUNAT' : 'Descartar Registro Local',
-      subtitle: isAcceptedBySunat ? 'R.S. 097-2012 / NOTA DE CRÉDITO UBL 2.1' : 'BORRADOR / LOCAL',
-      variant: 'danger',
-      message: isAcceptedBySunat
-        ? `Según la normativa SUNAT, un comprobante aceptado jamás debe eliminarse de la base de datos. Se emitirá automáticamente una NOTA DE CRÉDITO ELECTRÓNICA UBL 2.1 (Motivo 01: Anulación de la operación) para neutralizar legalmente ${doc.full_number} en el SIRE.`
-        : `El comprobante ${doc.full_number} no fue emitido ni aceptado por SUNAT. ¿Desea descartar su registro local de la base de datos?`,
-      details: [
-        { label: 'Comprobante', value: doc.full_number },
-        { label: 'Cliente Receptor', value: doc.client_name },
-        { label: 'Monto Total', value: `S/ ${Number(doc.total_amount).toFixed(2)}` },
-        { label: 'Fecha de Emisión', value: new Date(doc.issue_date).toLocaleDateString() },
-        { label: 'Efecto Contable', value: isAcceptedBySunat ? `Emisión Nota de Crédito ${doc.document_type === '01' ? 'FC01' : 'BC01'}` : 'Eliminación del registro' },
-      ],
-      requireCheckbox: isAcceptedBySunat,
-      checkboxLabel: 'Entiendo que esta acción emitirá una Nota de Crédito Electrónica que anula la operación fiscal.',
-      confirmText: isAcceptedBySunat ? 'Confirmar Anulación Fiscal' : 'Descartar Comprobante',
-      cancelText: 'Cancelar',
-      onConfirm: async () => {
-        setConfirmConfig(prev => ({ ...prev, isOpen: false }));
-        setLoading(true);
-        try {
-          if (isAcceptedBySunat) {
-            const res = await fetch(`${API_BASE}/documents/${doc.id}/anular-fiscal`, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'x-api-key': currentCompany.api_key,
-              },
-              body: JSON.stringify({
-                motivo: 'ANULACION DE LA OPERACION',
-              }),
-            });
-            const data = await res.json();
-            if (!res.ok) {
-              throw new Error(data.message || 'Error al emitir Nota de Crédito de anulación');
-            }
-            setFeedbackAlert({
-              type: 'success',
-              message: `ÉXITO: ${data.message || 'Comprobante anulado formalmente ante SUNAT.'}`
-            });
-          } else {
+    if (!isAcceptedBySunat) {
+      // Si es borrador o local sin aceptación, descarte local directo
+      setConfirmConfig({
+        isOpen: true,
+        title: 'Descartar Registro Local',
+        subtitle: 'BORRADOR / LOCAL',
+        variant: 'danger',
+        message: `El comprobante ${doc.full_number} no fue emitido ni aceptado por SUNAT. ¿Desea descartar su registro local de la base de datos?`,
+        details: [
+          { label: 'Comprobante', value: doc.full_number },
+          { label: 'Cliente Receptor', value: doc.client_name },
+          { label: 'Monto Total', value: `S/ ${Number(doc.total_amount).toFixed(2)}` },
+        ],
+        confirmText: 'Descartar Comprobante',
+        cancelText: 'Cancelar',
+        onConfirm: async () => {
+          setConfirmConfig(prev => ({ ...prev, isOpen: false }));
+          setLoading(true);
+          try {
             const res = await fetch(`${API_BASE}/documents/${doc.id}`, {
               method: 'DELETE',
               headers: { 'x-api-key': currentCompany.api_key }
             });
             const data = await res.json();
-            if (!res.ok) {
-              throw new Error(data.message || 'Error eliminando comprobante');
-            }
+            if (!res.ok) throw new Error(data.message || 'Error eliminando comprobante');
             setFeedbackAlert({
               type: 'success',
               message: `Comprobante ${doc.full_number} descartado exitosamente.`
             });
+            await fetchDocuments();
+            await fetchQueueStats();
+          } catch (err: any) {
+            setFeedbackAlert({ type: 'error', message: err.message });
+          } finally {
+            setLoading(false);
           }
-          await fetchDocuments();
-          await fetchQueueStats();
-        } catch (err: any) {
-          setFeedbackAlert({
-            type: 'error',
-            message: `Error en la anulación: ${err.message}`
-          });
-        } finally {
-          setLoading(false);
         }
-      }
+      });
+      return;
+    }
+
+    const issueDateObj = new Date(doc.issue_date);
+    const daysElapsed = Math.max(0, Math.floor((Date.now() - issueDateObj.getTime()) / (1000 * 60 * 60 * 24)));
+    const isWithin7Days = daysElapsed <= 7;
+
+    setFiscalAnnulModal({
+      isOpen: true,
+      doc,
+      method: isWithin7Days ? 'COMUNICACION_BAJA' : 'NOTA_CREDITO',
+      deliveredToClient: false,
+      motivo: 'ANULACION DE LA OPERACION',
+      loading: false,
     });
+  };
+
+  const handleConfirmFiscalAnnulment = async () => {
+    if (!currentCompany || !fiscalAnnulModal.doc) return;
+    setFiscalAnnulModal(prev => ({ ...prev, loading: true }));
+    const doc = fiscalAnnulModal.doc;
+
+    try {
+      const endpoint = fiscalAnnulModal.method === 'COMUNICACION_BAJA'
+        ? `${API_BASE}/documents/${doc.id}/comunicacion-baja`
+        : `${API_BASE}/documents/${doc.id}/anular-fiscal`;
+
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': currentCompany.api_key,
+        },
+        body: JSON.stringify({
+          motivo: fiscalAnnulModal.motivo,
+          deliveredToClient: fiscalAnnulModal.deliveredToClient,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.message || 'Error al procesar anulación en SUNAT');
+      }
+
+      setFeedbackAlert({
+        type: 'success',
+        message: `ÉXITO: ${data.message || 'Comprobante procesado exitosamente.'}`
+      });
+
+      setFiscalAnnulModal(prev => ({ ...prev, isOpen: false, doc: null, loading: false }));
+      await fetchDocuments();
+      await fetchQueueStats();
+    } catch (err: any) {
+      setFeedbackAlert({
+        type: 'error',
+        message: `ERROR: ${err.message}`
+      });
+      setFiscalAnnulModal(prev => ({ ...prev, loading: false }));
+    }
   };
 
   // Eliminación física del comprobante en base de datos
@@ -4962,6 +5009,189 @@ Idempotency-Key: cco_order_987654 (Opcional pero recomendado para cero duplicado
         onConfirm={confirmConfig.onConfirm}
         onCancel={() => setConfirmConfig(prev => ({ ...prev, isOpen: false }))}
       />
+
+      {/* MODAL OFICIAL DE ANULACIÓN SUNAT (COMUNICACIÓN DE BAJA VS NOTA DE CRÉDITO) */}
+      {fiscalAnnulModal.isOpen && fiscalAnnulModal.doc && (() => {
+        const doc = fiscalAnnulModal.doc;
+        const issueDateObj = new Date(doc.issue_date);
+        const daysElapsed = Math.max(0, Math.floor((Date.now() - issueDateObj.getTime()) / (1000 * 60 * 60 * 24)));
+        const isWithin7Days = daysElapsed <= 7;
+        const isFactura = doc.document_type === '01';
+
+        return (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-200">
+            <div className="bg-white rounded-2xl shadow-2xl max-w-xl w-full border border-slate-200 overflow-hidden">
+              {/* Header */}
+              <div className="p-5 flex items-start gap-4 border-b border-rose-100 bg-rose-50/40">
+                <div className="w-12 h-12 rounded-xl flex items-center justify-center shrink-0 bg-rose-100 ring-4 ring-rose-50 text-rose-600">
+                  <Ban className="w-6 h-6" />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <span className="inline-block px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider rounded border border-rose-200 bg-rose-50 text-rose-700 mb-1">
+                    ANULACIÓN OFICIAL SUNAT &bull; UBL 2.1
+                  </span>
+                  <h3 className="text-lg font-bold text-slate-900 leading-snug">
+                    Anular Comprobante {doc.full_number}
+                  </h3>
+                  <p className="text-xs text-slate-500 font-medium">
+                    Cliente: <strong>{doc.client_name}</strong> &bull; Total: <strong>S/ {Number(doc.total_amount).toFixed(2)}</strong>
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setFiscalAnnulModal(prev => ({ ...prev, isOpen: false, doc: null }))}
+                  disabled={fiscalAnnulModal.loading}
+                  className="p-1 text-slate-400 hover:text-slate-600 rounded-lg hover:bg-slate-100 transition-colors"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              {/* Body */}
+              <div className="p-5 space-y-4 max-h-[70vh] overflow-y-auto">
+                {/* Diagnóstico de Días */}
+                <div className="flex flex-wrap items-center justify-between gap-2 p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs">
+                  <div className="flex items-center gap-1.5 font-bold text-slate-700">
+                    <Clock className="w-4 h-4 text-indigo-600" />
+                    <span>Emitido hace: <strong className="text-slate-900">{daysElapsed} {daysElapsed === 1 ? 'día' : 'días'}</strong></span>
+                  </div>
+                  {isWithin7Days ? (
+                    <span className="px-2 py-0.5 rounded-full text-[10px] font-black bg-emerald-100 text-emerald-800 border border-emerald-300">
+                      ✓ Dentro de los 7 días calendario
+                    </span>
+                  ) : (
+                    <span className="px-2 py-0.5 rounded-full text-[10px] font-black bg-amber-100 text-amber-800 border border-amber-300">
+                      ⚠ Superó los 7 días calendario
+                    </span>
+                  )}
+                </div>
+
+                {/* Pregunta Clave: ¿Entregado al cliente? */}
+                <div className="p-3 bg-white border border-slate-200 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                  <div>
+                    <p className="text-xs font-black text-slate-800">¿El comprobante ya fue entregado al cliente?</p>
+                    <p className="text-[10px] text-slate-500">SUNAT: Si el adquirente ya lo tiene, se debe emitir Nota de Crédito.</p>
+                  </div>
+                  <div className="flex items-center gap-1.5 bg-slate-100 p-1 rounded-xl shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setFiscalAnnulModal(prev => ({
+                          ...prev,
+                          deliveredToClient: false,
+                          method: isWithin7Days ? 'COMUNICACION_BAJA' : 'NOTA_CREDITO',
+                        }));
+                      }}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-black transition-all ${
+                        !fiscalAnnulModal.deliveredToClient
+                          ? 'bg-white text-slate-900 shadow-sm border border-slate-200'
+                          : 'text-slate-500 hover:text-slate-800'
+                      }`}
+                    >
+                      No entregado
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setFiscalAnnulModal(prev => ({
+                          ...prev,
+                          deliveredToClient: true,
+                          method: 'NOTA_CREDITO',
+                        }));
+                      }}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-black transition-all ${
+                        fiscalAnnulModal.deliveredToClient
+                          ? 'bg-blue-600 text-white shadow-sm'
+                          : 'text-slate-500 hover:text-slate-800'
+                      }`}
+                    >
+                      Ya entregado
+                    </button>
+                  </div>
+                </div>
+
+                {/* Selección de Método */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div
+                    onClick={() => setFiscalAnnulModal(prev => ({ ...prev, method: 'COMUNICACION_BAJA' }))}
+                    className={`p-3 rounded-xl border-2 transition-all cursor-pointer ${
+                      fiscalAnnulModal.method === 'COMUNICACION_BAJA'
+                        ? 'border-emerald-500 bg-emerald-50/40 ring-2 ring-emerald-400/20 shadow-sm'
+                        : 'border-slate-200 hover:border-slate-300 bg-white'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="text-xs font-black text-slate-900">1. Comunicación de Baja</span>
+                      {isWithin7Days && !fiscalAnnulModal.deliveredToClient && (
+                        <span className="text-[9px] font-black bg-emerald-600 text-white px-1.5 py-0.5 rounded">Recomendado</span>
+                      )}
+                    </div>
+                    <p className="text-[10px] text-slate-600 leading-tight">
+                      Aviso directo a SUNAT. Anula el comprobante sin gastar series de Nota de Crédito.
+                    </p>
+                  </div>
+
+                  <div
+                    onClick={() => setFiscalAnnulModal(prev => ({ ...prev, method: 'NOTA_CREDITO' }))}
+                    className={`p-3 rounded-xl border-2 transition-all cursor-pointer ${
+                      fiscalAnnulModal.method === 'NOTA_CREDITO'
+                        ? 'border-blue-500 bg-blue-50/40 ring-2 ring-blue-400/20 shadow-sm'
+                        : 'border-slate-200 hover:border-slate-300 bg-white'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="text-xs font-black text-slate-900">2. Nota de Crédito</span>
+                      {(!isWithin7Days || fiscalAnnulModal.deliveredToClient) && (
+                        <span className="text-[9px] font-black bg-blue-600 text-white px-1.5 py-0.5 rounded">Requerido</span>
+                      )}
+                    </div>
+                    <p className="text-[10px] text-slate-600 leading-tight">
+                      Emite {isFactura ? 'FC01' : 'BC01'} oficial firmada con certificado digital ante SUNAT.
+                    </p>
+                  </div>
+                </div>
+
+                {/* Motivo de Anulación */}
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-600 uppercase mb-1">
+                    Motivo de la Anulación:
+                  </label>
+                  <input
+                    type="text"
+                    value={fiscalAnnulModal.motivo}
+                    onChange={(e) => setFiscalAnnulModal(prev => ({ ...prev, motivo: e.target.value }))}
+                    className="w-full px-3 py-2 text-xs border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-slate-400"
+                  />
+                </div>
+              </div>
+
+              {/* Footer */}
+              <div className="p-4 bg-slate-50 border-t border-slate-200 flex justify-end gap-2.5">
+                <button
+                  type="button"
+                  onClick={() => setFiscalAnnulModal(prev => ({ ...prev, isOpen: false, doc: null }))}
+                  disabled={fiscalAnnulModal.loading}
+                  className="px-4 py-2 text-xs font-bold text-slate-600 hover:text-slate-800 transition"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="button"
+                  onClick={handleConfirmFiscalAnnulment}
+                  disabled={fiscalAnnulModal.loading}
+                  className={`px-5 py-2 text-xs font-bold text-white rounded-xl shadow-md transition disabled:opacity-50 flex items-center gap-1.5 ${
+                    fiscalAnnulModal.method === 'COMUNICACION_BAJA'
+                      ? 'bg-emerald-600 hover:bg-emerald-700 shadow-emerald-600/20'
+                      : 'bg-rose-600 hover:bg-rose-700 shadow-rose-600/20'
+                  }`}
+                >
+                  {fiscalAnnulModal.loading ? 'Procesando ante SUNAT...' : fiscalAnnulModal.method === 'COMUNICACION_BAJA' ? 'Confirmar Baja Directa' : 'Emitir Nota de Crédito'}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* NOTIFICACIÓN / ALERTA VISUAL ELEGANTE (SIN ALERT DE NAVEGADOR) */}
       {feedbackAlert && (
