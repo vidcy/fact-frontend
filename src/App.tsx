@@ -220,7 +220,14 @@ export function App() {
   const [motivoTraslado, setMotivoTraslado] = useState('01');
   const [motivoTrasladoDesc, setMotivoTrasladoDesc] = useState('Venta');
   const [modalidadTraslado, setModalidadTraslado] = useState<'01' | '02'>('02');
-  const [fechaInicioTraslado, setFechaInicioTraslado] = useState<string>(() => new Date().toISOString().split('T')[0]);
+  const [fechaInicioTraslado, setFechaInicioTraslado] = useState<string>(() =>
+    new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/Lima',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(new Date()),
+  );
   const [pesoBrutoTotal, setPesoBrutoTotal] = useState<number>(10.0);
   const [numeroBultos, setNumeroBultos] = useState<number>(1);
   const [puntoPartidaDireccion, setPuntoPartidaDireccion] = useState('');
