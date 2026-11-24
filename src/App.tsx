@@ -18,6 +18,7 @@ import {
   ShieldCheck,
   Check,
   ChevronRight,
+  ChevronDown,
   TrendingUp,
   CreditCard,
   Hash,
@@ -82,12 +83,15 @@ interface Company {
 }
 
 interface DocumentItem {
+  id?: string;
   code: string;
   description: string;
   unit_measure: string;
   quantity: number;
   unit_price: number;
   igv_affectation_type: string;
+  subtotal?: number;
+  total?: number;
 }
 
 interface DocumentRecord {
@@ -119,6 +123,12 @@ interface DocumentRecord {
   xml_digest_value?: string;
   qr_data?: string;
   created_at: string;
+  ref_document_type?: string;
+  ref_series?: string;
+  ref_number?: number;
+  ref_reason_code?: string;
+  ref_reason_desc?: string;
+  metadata?: any;
 }
 
 /**
@@ -129,11 +139,19 @@ interface DocumentRecord {
 export function App() {
   // 1. Estado de Autenticación de Administrador Maestro
   const [adminUser, setAdminUser] = useState<any>(() => {
-    const saved = localStorage.getItem('ccofact_admin_user');
-    return saved ? JSON.parse(saved) : null;
+    try {
+      const saved = localStorage.getItem('ccofact_admin_user');
+      return saved ? JSON.parse(saved) : null;
+    } catch {
+      return null;
+    }
   });
   const [adminToken, setAdminToken] = useState<string | null>(() => {
-    return localStorage.getItem('ccofact_admin_token') || null;
+    try {
+      return localStorage.getItem('ccofact_admin_token') || null;
+    } catch {
+      return null;
+    }
   });
 
   // 2. Navegación Principal por Pestañas
@@ -149,40 +167,324 @@ export function App() {
   const [copiedKey, setCopiedKey] = useState(false);
   const [queueStats, setQueueStats] = useState<any>({ counts: [], recentJobs: [] });
 
-  // Filtros y Paginación en Documentos
+  // Filtros y Paginación en Documentos CCOFACT PRO
   const [docSearchTerm, setDocSearchTerm] = useState('');
   const [docFilterType, setDocFilterType] = useState('ALL');
   const [docFilterStatus, setDocFilterStatus] = useState('ALL');
+  const [docFilterStartDate, setDocFilterStartDate] = useState('');
+  const [docFilterEndDate, setDocFilterEndDate] = useState('');
+  const [docViewMode, setDocViewMode] = useState<'EXPEDIENTES' | 'TODOS'>('EXPEDIENTES');
   const [docPage, setDocPage] = useState(1);
-  const [docPageSize, setDocPageSize] = useState(25);
+  const [docPageSize, setDocPageSize] = useState(6);
+  const [expandedDocIds, setExpandedDocIds] = useState<Record<string, boolean>>({});
 
-  const filteredDocRecords = useMemo(() => {
-    return documents.filter((d) => {
-      if (docFilterType !== 'ALL' && d.document_type !== docFilterType) return false;
-      if (docFilterStatus === 'ACCEPTED' && !d.status.includes('ACCEPTED')) return false;
-      if (docFilterStatus === 'ANULADO' && d.status !== 'ANULADO') return false;
-      if (docFilterStatus === 'REJECTED' && (d.status.includes('ACCEPTED') || d.status === 'ANULADO')) return false;
+  // Estructuración Jerárquica y Trazabilidad Comercial (Padre Boleta/Factura -> Hijos Notas Crédito/Débito)
+  const groupedDocTree = useMemo(() => {
+    const safeDocs = Array.isArray(documents) ? documents.filter(Boolean) : [];
+
+    // Helper timestamp para ordenamiento cronológico estricto de más reciente a más antiguo
+    const getDocTimestamp = (d: DocumentRecord) => {
+      if (d.created_at) {
+        const t = new Date(d.created_at).getTime();
+        if (!isNaN(t)) return t;
+      }
+      if (d.issue_date) {
+        const timeStr = d.issue_time || '00:00:00';
+        const t = new Date(`${d.issue_date}T${timeStr}`).getTime();
+        if (!isNaN(t)) return t;
+      }
+      return 0;
+    };
+
+    const matchingDocs = safeDocs.filter((d) => {
+      if (!d) return false;
+      const status = d.status || '';
+      if (docFilterStatus === 'ACCEPTED' && !status.includes('ACCEPTED')) return false;
+      if (docFilterStatus === 'ANULADO' && status !== 'ANULADO') return false;
+      if (docFilterStatus === 'REJECTED' && (status.includes('ACCEPTED') || status === 'ANULADO')) return false;
+
+      const docDate = d.issue_date || (d.created_at ? String(d.created_at).split('T')[0] : '');
+      if (docFilterStartDate && docDate && docDate < docFilterStartDate) return false;
+      if (docFilterEndDate && docDate && docDate > docFilterEndDate) return false;
 
       if (docSearchTerm.trim()) {
         const term = docSearchTerm.toLowerCase();
         const matchNumber = d.full_number?.toLowerCase().includes(term);
         const matchName = d.client_name?.toLowerCase().includes(term);
         const matchDoc = d.client_doc_number?.toLowerCase().includes(term);
-        return matchNumber || matchName || matchDoc;
+        const matchRef = d.ref_series ? `${d.ref_series}-${d.ref_number}`.toLowerCase().includes(term) : false;
+        return matchNumber || matchName || matchDoc || matchRef;
       }
       return true;
     });
-  }, [documents, docFilterType, docFilterStatus, docSearchTerm]);
 
-  const docTotalPages = Math.max(1, Math.ceil(filteredDocRecords.length / docPageSize));
-  const paginatedDocRecords = useMemo(() => {
+    // Ordenamiento cronológico estricto: De más reciente a más antiguo
+    const sortedMatchingDocs = [...matchingDocs].sort((a, b) => getDocTimestamp(b) - getDocTimestamp(a));
+
+    // MODO 2: Cronograma Continuo (Todos los comprobantes planos de más reciente a más antiguo)
+    if (docViewMode === 'TODOS') {
+      if (docFilterType !== 'ALL') {
+        return sortedMatchingDocs
+          .filter((d) => d && d.document_type === docFilterType)
+          .map((d) => ({ doc: d, notes: [] as DocumentRecord[] }));
+      }
+      return sortedMatchingDocs.map((d) => ({
+        doc: d,
+        notes: [] as DocumentRecord[],
+      }));
+    }
+
+    // MODO 1: Expedientes Tributarios (Principal y por defecto)
+    // Conecta Boletas (03), Facturas (01) y Guías (09) con su línea de trazabilidad de Notas
+    if (docFilterType !== 'ALL') {
+      return sortedMatchingDocs
+        .filter((d) => d && d.document_type === docFilterType)
+        .map((d) => ({ doc: d, notes: [] as DocumentRecord[] }));
+    }
+
+    const notesMap: Record<string, DocumentRecord[]> = {};
+    safeDocs.forEach((d) => {
+      if (!d) return;
+      if ((d.document_type === '07' || d.document_type === '08') && d.ref_series && d.ref_number) {
+        const parentKey = `${d.ref_series}-${d.ref_number}`.toUpperCase();
+        if (!notesMap[parentKey]) notesMap[parentKey] = [];
+        notesMap[parentKey].push(d);
+      }
+    });
+
+    const rootList: DocumentRecord[] = [];
+    sortedMatchingDocs.forEach((d) => {
+      if (!d) return;
+      if (d.document_type === '01' || d.document_type === '03' || d.document_type === '09') {
+        rootList.push(d);
+      } else if (d.document_type === '07' || d.document_type === '08') {
+        const parentKey = d.ref_series && d.ref_number ? `${d.ref_series}-${d.ref_number}`.toUpperCase() : null;
+        const parentExists = parentKey && safeDocs.some((p) => p && `${p.series || ''}-${p.number || ''}`.toUpperCase() === parentKey);
+        // Si no tiene expediente padre en el sistema, se lista para no perder visibilidad
+        if (!parentExists) {
+          rootList.push(d);
+        }
+      } else {
+        rootList.push(d);
+      }
+    });
+
+    return rootList.map((root) => {
+      const parentKey = `${root.series || ''}-${root.number || ''}`.toUpperCase();
+      const linkedNotes = (notesMap[parentKey] || []).sort((a, b) => getDocTimestamp(b) - getDocTimestamp(a));
+      return {
+        doc: root,
+        notes: linkedNotes,
+      };
+    });
+  }, [documents, docFilterType, docFilterStatus, docFilterStartDate, docFilterEndDate, docSearchTerm, docViewMode]);
+
+  const docTotalPages = Math.max(1, Math.ceil(groupedDocTree.length / docPageSize));
+  const paginatedDocTree = useMemo(() => {
     const start = (docPage - 1) * docPageSize;
-    return filteredDocRecords.slice(start, start + docPageSize);
-  }, [filteredDocRecords, docPage, docPageSize]);
+    return groupedDocTree.slice(start, start + docPageSize);
+  }, [groupedDocTree, docPage, docPageSize]);
+
+  // Métricas financieras y de cumplimiento tributario para los KPI ejecutivos
+  const docMetrics = useMemo(() => {
+    const safeDocs = Array.isArray(documents) ? documents.filter(Boolean) : [];
+    const totalCount = safeDocs.length;
+    let totalPEN = 0;
+    let totalUSD = 0;
+    let notesCount = 0;
+    let acceptedCount = 0;
+
+    safeDocs.forEach((d) => {
+      const amt = Number(d.total_amount) || 0;
+      if (d.document_type === '07' || d.document_type === '08') {
+        notesCount++;
+      } else {
+        if (d.currency === 'USD') totalUSD += amt;
+        else totalPEN += amt;
+      }
+      if ((d.status || '').includes('ACCEPTED')) {
+        acceptedCount++;
+      }
+    });
+
+    const complianceRate = totalCount > 0 ? Math.round((acceptedCount / totalCount) * 100) : 100;
+
+    return {
+      totalCount,
+      totalPEN,
+      totalUSD,
+      notesCount,
+      acceptedCount,
+      complianceRate,
+    };
+  }, [documents]);
 
   useEffect(() => {
     setDocPage(1);
-  }, [docSearchTerm, docFilterType, docFilterStatus, docPageSize]);
+  }, [docSearchTerm, docFilterType, docFilterStatus, docFilterStartDate, docFilterEndDate, docPageSize, docViewMode]);
+
+  // Helper oficial para determinar el Estado Estricto de SUNAT (sin alterar por estado comercial)
+  const getOfficialSunatStatus = (doc?: DocumentRecord | null) => {
+    if (!doc) return { label: 'DESCONOCIDO', bgClass: 'bg-slate-100 text-slate-700 border-slate-300', code: '-', desc: 'Sin registro' };
+    const rawStatus = (doc.status || '').toUpperCase();
+    if (rawStatus.includes('ACCEPTED') || rawStatus === '0') {
+      if (rawStatus.includes('OBSERV') || (doc.sunat_notes && doc.sunat_notes.length > 0)) {
+        return {
+          label: 'ACEPTADO C/ OBS',
+          bgClass: 'bg-emerald-50 text-emerald-800 border-emerald-300',
+          code: '0',
+          desc: doc.sunat_description || 'Comprobante aceptado con observaciones por SUNAT',
+        };
+      }
+      return {
+        label: 'ACEPTADO',
+        bgClass: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+        code: '0',
+        desc: doc.sunat_description || 'El comprobante ha sido aceptado por SUNAT',
+      };
+    }
+    if (rawStatus === 'REJECTED' || (doc.sunat_response_code && doc.sunat_response_code !== '0' && doc.sunat_response_code !== '')) {
+      return {
+        label: `RECHAZADO ${doc.sunat_response_code ? `(${doc.sunat_response_code})` : ''}`.trim(),
+        bgClass: 'bg-rose-50 text-rose-700 border-rose-300',
+        code: doc.sunat_response_code || '9999',
+        desc: doc.sunat_description || 'Comprobante rechazado por SUNAT',
+      };
+    }
+    if (rawStatus === 'QUEUED') {
+      return {
+        label: 'EN COLA / PROCESO',
+        bgClass: 'bg-amber-50 text-amber-700 border-amber-300',
+        code: 'QUEUED',
+        desc: 'En cola transaccional para envío a SUNAT',
+      };
+    }
+    if (rawStatus === 'BAJA_ACCEPTED') {
+      return {
+        label: 'BAJA ACEPTADA',
+        bgClass: 'bg-indigo-50 text-indigo-700 border-indigo-200',
+        code: 'BAJA',
+        desc: 'Comunicación de baja aceptada formalmente por SUNAT',
+      };
+    }
+    if (rawStatus === 'ANULADO') {
+      // Regla SUNAT: Si un comprobante fue aceptado y luego se anuló por NC, su estado tributario en SUNAT sigue siendo ACEPTADO
+      if (doc.cdr_xml || doc.sunat_response_code === '0' || !doc.sunat_response_code) {
+        return {
+          label: 'ACEPTADO',
+          bgClass: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+          code: '0',
+          desc: doc.sunat_description || 'El comprobante original fue aceptado formalmente por SUNAT',
+        };
+      }
+    }
+    return {
+      label: rawStatus || 'LOCAL',
+      bgClass: 'bg-slate-100 text-slate-700 border-slate-300',
+      code: '-',
+      desc: 'Borrador o registro local',
+    };
+  };
+
+  // Helper oficial para determinar el Estado Comercial y Movimiento Operativo (con balance y trazabilidad)
+  const getCommercialMovementStatus = (doc?: DocumentRecord | null, notes: DocumentRecord[] = []) => {
+    if (!doc) {
+      return {
+        type: 'VIGENTE',
+        badge: 'VIGENTE',
+        badgeClass: 'bg-slate-100 text-slate-700 border-slate-300',
+        sublabel: 'Sin datos',
+        saldo: 0,
+        totalCredit: 0,
+        totalDebit: 0,
+        hasAdjustments: false,
+        creditNotes: [],
+        debitNotes: [],
+      };
+    }
+
+    const rawStatus = (doc.status || '').toUpperCase();
+    const total = Number(doc.total_amount || 0);
+
+    const safeNotes = Array.isArray(notes) ? notes.filter(Boolean) : [];
+    const creditNotes = safeNotes.filter((n) => n.document_type === '07');
+    const debitNotes = safeNotes.filter((n) => n.document_type === '08');
+
+    const totalCredit = creditNotes.reduce((acc, n) => acc + (Number(n.total_amount) || 0), 0);
+    const totalDebit = debitNotes.reduce((acc, n) => acc + (Number(n.total_amount) || 0), 0);
+
+    const calculatedBalance = Number((total - totalCredit + totalDebit).toFixed(2));
+    const safeBalance = Math.max(0, calculatedBalance);
+
+    // Detección estricta de anulación total:
+    // 1. Si el saldo calculado es 0 o menor (extinguido completamente por notas)
+    // 2. Si el registro tiene status 'ANULADO' y saldo <= 0.01
+    // 3. Si existe una Nota de Crédito explícita de anulación (Motivo 01 o 02) Y el saldo remanente es <= 0.01
+    const isExplicitAnnulNote = creditNotes.some(
+      (n) => ['01', '02'].includes(n.ref_reason_code || '') || (n.ref_reason_desc || '').toUpperCase().includes('ANULACION DE LA OPERACION'),
+    );
+
+    const isFullyLiquidated = safeNotes.length > 0 && safeBalance <= 0.009;
+
+    if (rawStatus === 'ANULADO' || isFullyLiquidated || (isExplicitAnnulNote && safeBalance <= 0.009)) {
+      const noteRef = creditNotes.find(n => ['01', '02'].includes(n.ref_reason_code || ''))?.full_number || creditNotes[creditNotes.length - 1]?.full_number || '';
+      return {
+        type: 'ANULADO_TOTAL',
+        badge: 'ANULADO TOTAL',
+        badgeClass: 'bg-rose-50 text-rose-700 border-rose-300 font-extrabold',
+        sublabel: noteRef ? `Por NC ${noteRef}` : 'Operación Anulada',
+        saldo: 0,
+        totalCredit,
+        totalDebit,
+        hasAdjustments: safeNotes.length > 0,
+        creditNotes,
+        debitNotes,
+      };
+    }
+
+    if (safeNotes.length > 0) {
+      return {
+        type: 'MODIFICADO',
+        badge: 'MODIFICADO',
+        badgeClass: 'bg-amber-50 text-amber-800 border-amber-300 font-extrabold',
+        sublabel: `Saldo: ${doc.currency === 'USD' ? '$' : 'S/'} ${safeBalance.toFixed(2)} (${safeNotes.length} Nota${safeNotes.length > 1 ? 's' : ''})`,
+        saldo: safeBalance,
+        totalCredit,
+        totalDebit,
+        hasAdjustments: true,
+        creditNotes,
+        debitNotes,
+      };
+    }
+
+    if (rawStatus === 'REJECTED') {
+      return {
+        type: 'RECHAZADO',
+        badge: 'NO PROCEDE',
+        badgeClass: 'bg-slate-100 text-slate-700 border-slate-300',
+        sublabel: 'Rechazado por SUNAT',
+        saldo: 0,
+        totalCredit: 0,
+        totalDebit: 0,
+        hasAdjustments: false,
+        creditNotes: [],
+        debitNotes: [],
+      };
+    }
+
+    return {
+      type: 'VIGENTE',
+      badge: 'VIGENTE',
+      badgeClass: 'bg-emerald-50 text-emerald-700 border-emerald-300 font-bold',
+      sublabel: 'Operación activa',
+      saldo: total,
+      totalCredit: 0,
+      totalDebit: 0,
+      hasAdjustments: false,
+      creditNotes: [],
+      debitNotes: [],
+    };
+  };
 
   // 5. Modales Operativos y Alertas de Confirmación Estricta
   const [showIntegrationModal, setShowIntegrationModal] = useState(false);
@@ -214,7 +516,7 @@ export function App() {
     isOpen: false,
     title: '',
     message: '',
-    onConfirm: () => {},
+    onConfirm: () => { },
   });
 
   // Catálogos Oficiales SUNAT
@@ -246,6 +548,8 @@ export function App() {
   const [fiscalAnnulModal, setFiscalAnnulModal] = useState<{
     isOpen: boolean;
     doc: DocumentRecord | null;
+    remainingBalance: number;
+    notes: DocumentRecord[];
     method: 'NOTA_CREDITO';
     deliveredToClient: boolean;
     motivo: string;
@@ -253,6 +557,8 @@ export function App() {
   }>({
     isOpen: false,
     doc: null,
+    remainingBalance: 0,
+    notes: [],
     method: 'NOTA_CREDITO',
     deliveredToClient: true,
     motivo: 'ANULACION DE LA OPERACION (MOTIVO 01)',
@@ -288,6 +594,8 @@ export function App() {
   const [manualNoteModal, setManualNoteModal] = useState<{
     isOpen: boolean;
     doc: DocumentRecord | null;
+    remainingBalance: number;
+    notes: DocumentRecord[];
     noteType: '07' | '08';
     reasonCode: string;
     reasonText: string;
@@ -297,9 +605,11 @@ export function App() {
   }>({
     isOpen: false,
     doc: null,
+    remainingBalance: 0,
+    notes: [],
     noteType: '07',
     reasonCode: '01',
-    reasonText: '',
+    reasonText: 'Anulación de la operación',
     amount: 0,
     issueDate: '',
     loading: false,
@@ -792,16 +1102,20 @@ export function App() {
   const fetchCompanies = async () => {
     try {
       const res = await fetch(`${API_BASE}/companies`);
+      if (!res.ok) {
+        throw new Error(`Error ${res.status}: ${res.statusText}`);
+      }
       const data = await res.json();
-      
+      const rawList: Company[] = Array.isArray(data) ? data.filter(Boolean) : [];
+
       const availableCompanies =
         adminUser?.companyId && adminUser.role !== 'SUPER_ADMIN'
-          ? data.filter((c: Company) => c.id === adminUser.companyId)
-          : data;
+          ? rawList.filter((c: Company) => c && c.id === adminUser.companyId)
+          : rawList;
 
       setCompanies(availableCompanies);
       if (availableCompanies.length > 0) {
-        if (!currentCompany || !availableCompanies.some((c: Company) => c.id === currentCompany.id)) {
+        if (!currentCompany || !availableCompanies.some((c: Company) => c && c.id === currentCompany.id)) {
           setCurrentCompany(availableCompanies[0]);
         }
       } else {
@@ -810,6 +1124,7 @@ export function App() {
       }
     } catch (err) {
       console.error('Error cargando empresas:', err);
+      setCompanies([]);
     }
   };
 
@@ -823,26 +1138,35 @@ export function App() {
       });
       if (res.ok) {
         const data = await res.json();
-        setCompanySeries(data || []);
+        setCompanySeries(Array.isArray(data) ? data.filter(Boolean) : []);
+      } else {
+        setCompanySeries([]);
       }
     } catch (err) {
       console.error('Error cargando series:', err);
+      setCompanySeries([]);
     }
   };
 
   // Consulta de comprobantes emitidos
   const fetchDocuments = async () => {
-    if (!currentCompany) return;
+    if (!currentCompany?.api_key) return;
     setLoading(true);
     try {
       const res = await fetch(`${API_BASE}/documents?limit=100`, {
         headers: { 'x-api-key': currentCompany.api_key }
       });
-      const data = await res.json();
-      setDocuments(data.data || []);
+      if (res.ok) {
+        const data = await res.json();
+        const docs = Array.isArray(data?.data) ? data.data : (Array.isArray(data) ? data : []);
+        setDocuments(docs.filter(Boolean));
+      } else {
+        setDocuments([]);
+      }
       await fetchCompanySeries(currentCompany);
     } catch (err) {
       console.error('Error cargando documentos:', err);
+      setDocuments([]);
     } finally {
       setLoading(false);
     }
@@ -980,8 +1304,9 @@ export function App() {
     const totalMonto = Number(totalsCalc.total);
 
     // Reglas por tipo de comprobante
+    const safeSeries = series || '';
     if (docType === '01') {
-      if (!series.startsWith('F')) {
+      if (!safeSeries.startsWith('F')) {
         errors.push(`Serie inválida: Para Facturas Electrónicas la serie debe iniciar con 'F' (ej. F001, F002).`);
       }
       if (clientDocType !== '6') {
@@ -994,7 +1319,7 @@ export function App() {
         errors.push(`Razón Social del receptor es obligatoria para emisión de Factura.`);
       }
     } else if (docType === '03') {
-      if (!series.startsWith('B')) {
+      if (!safeSeries.startsWith('B')) {
         errors.push(`Serie inválida: Para Boletas de Venta la serie debe iniciar con 'B' (ej. B001, B002).`);
       }
       if (totalMonto > 700 && clientDocType === '0') {
@@ -1011,7 +1336,7 @@ export function App() {
       }
     } else if (docType === '07') {
       const expectedPrefix = refDocType === '01' ? 'FC' : 'BC';
-      if (!series.startsWith(expectedPrefix)) {
+      if (!safeSeries.startsWith(expectedPrefix)) {
         errors.push(`Serie inválida para Nota de Crédito: Modifica ${refDocType === '01' ? 'Factura' : 'Boleta'}, por tanto su serie debe iniciar con '${expectedPrefix}' (ej. ${expectedPrefix}01).`);
       }
       if (!refSeries.trim()) {
@@ -1025,14 +1350,14 @@ export function App() {
       }
     } else if (docType === '08') {
       const expectedPrefix = refDocType === '01' ? 'FD' : 'BD';
-      if (!series.startsWith(expectedPrefix)) {
+      if (!safeSeries.startsWith(expectedPrefix)) {
         errors.push(`Serie inválida para Nota de Débito: Modifica ${refDocType === '01' ? 'Factura' : 'Boleta'}, por tanto su serie debe iniciar con '${expectedPrefix}' (ej. ${expectedPrefix}01).`);
       }
       if (!refSeries.trim() || !refNumber || refNumber <= 0) {
         errors.push(`Datos del comprobante modificado son obligatorios.`);
       }
     } else if (docType === '09') {
-      if (!series.startsWith('T')) {
+      if (!safeSeries.startsWith('T')) {
         errors.push(`Serie inválida: Para Guía de Remisión Remitente la serie debe iniciar con 'T' (ej. T001).`);
       }
       if (!puntoPartidaDireccion.trim()) {
@@ -1072,13 +1397,14 @@ export function App() {
       errors.push(`Debe ingresar al menos un ítem o producto en el comprobante.`);
     }
     items.forEach((it, idx) => {
-      if (!it.description.trim()) {
+      const desc = it?.description || '';
+      if (!desc.trim()) {
         errors.push(`Ítem #${idx + 1}: Descripción vacía.`);
       }
-      if (Number(it.quantity) <= 0) {
+      if (Number(it?.quantity || 0) <= 0) {
         errors.push(`Ítem #${idx + 1}: Cantidad debe ser mayor a 0.`);
       }
-      if (docType !== '09' && Number(it.unit_price) < 0) {
+      if (docType !== '09' && Number(it?.unit_price || 0) < 0) {
         errors.push(`Ítem #${idx + 1}: Precio unitario no puede ser negativo.`);
       }
     });
@@ -1210,7 +1536,7 @@ export function App() {
       await fetchQueueStats();
       await fetchCompanySeries();
       setIdempotencyKey('');
-      
+
       setFeedbackAlert({
         type: 'success',
         message: `Comprobante ${created.full_number || 'emitido'} procesado y transmitido con éxito.`
@@ -1588,19 +1914,21 @@ export function App() {
     }
   };
 
-  // Anulación fiscal oficial SUNAT: Comunicación de Baja (≤ 7 días) vs Nota de Crédito (Tipo 01)
-  const handleAnularDocument = (doc: DocumentRecord) => {
+  // Anulación fiscal oficial SUNAT: Comunicación de Baja (≤ 7 días) vs Nota de Crédito (Tipo 01) por el saldo remanente exacto
+  const handleAnularDocument = (doc: DocumentRecord, notes: DocumentRecord[] = []) => {
     if (!currentCompany) return;
 
-    if (doc.status === 'ANULADO') {
+    const commStatus = getCommercialMovementStatus(doc, notes);
+
+    if (doc.status === 'ANULADO' || commStatus.saldo <= 0.009) {
       setFeedbackAlert({
         type: 'info',
-        message: `El comprobante ${doc.full_number} ya se encuentra formalmente anulado ante SUNAT.`
+        message: `El comprobante ${doc.full_number} ya no tiene saldo pendiente por anular (Saldo actual: S/ 0.00). La operación ya fue completamente liquidada o anulada.`
       });
       return;
     }
 
-    const isAcceptedBySunat = doc.status.includes('ACCEPTED');
+    const isAcceptedBySunat = (doc?.status || '').includes('ACCEPTED');
 
     if (!isAcceptedBySunat) {
       // Si es borrador o local sin aceptación, descarte local directo
@@ -1643,10 +1971,12 @@ export function App() {
       return;
     }
 
-    // Normativa SUNAT UBL 2.1 (CERO BAJAS): Todo comprobante aceptado se anula con Nota de Crédito Tipo 01
+    // Normativa SUNAT UBL 2.1: Todo comprobante aceptado se anula con Nota de Crédito Tipo 01 por el saldo remanente exacto
     setFiscalAnnulModal({
       isOpen: true,
       doc,
+      remainingBalance: commStatus.saldo,
+      notes,
       method: 'NOTA_CREDITO',
       deliveredToClient: true,
       motivo: 'ANULACION DE LA OPERACION (MOTIVO 01)',
@@ -1748,7 +2078,7 @@ export function App() {
           client_address: smartEditModal.clientAddress,
           client_email: smartEditModal.clientEmail,
           issue_date: smartEditModal.issueDate,
-          items: smartEditModal.items.map(it => ({
+          items: (smartEditModal.items || []).map(it => ({
             name: it.name,
             quantity: Number(it.quantity),
             price: Number(it.price),
@@ -1778,15 +2108,26 @@ export function App() {
     }
   };
 
-  // Emisión Manual de Nota (Catálogo 09 / 10)
-  const handleOpenManualNote = (doc: DocumentRecord) => {
+  // Emisión Manual de Nota (Catálogo 09 / 10 SUNAT UBL 2.1)
+  const handleOpenManualNote = (doc: DocumentRecord, docNotes?: DocumentRecord[]) => {
+    const notes = docNotes || documents.filter(d =>
+      (d.document_type === '07' || d.document_type === '08') &&
+      d.ref_series === doc.series &&
+      Number(d.ref_number) === Number(doc.number) &&
+      (d.status?.includes('ACCEPTED') || d.status === 'ACCEPTED')
+    );
+    const commStatus = getCommercialMovementStatus(doc, notes);
+    const defaultReason = SUNAT_CAT_09[0];
+
     setManualNoteModal({
       isOpen: true,
       doc,
+      remainingBalance: commStatus.saldo,
+      notes,
       noteType: '07',
-      reasonCode: '01',
-      reasonText: '',
-      amount: Number(doc.total_amount),
+      reasonCode: defaultReason.code,
+      reasonText: defaultReason.desc,
+      amount: commStatus.saldo,
       issueDate: new Date().toISOString().split('T')[0],
       loading: false,
     });
@@ -1794,8 +2135,68 @@ export function App() {
 
   const handleConfirmManualNote = async () => {
     if (!currentCompany || !manualNoteModal.doc) return;
-    setManualNoteModal(prev => ({ ...prev, loading: true }));
     const doc = manualNoteModal.doc;
+
+    // Validaciones tributarias rigurosas SUNAT UBL 2.1
+    if (!manualNoteModal.reasonText || !manualNoteModal.reasonText.trim()) {
+      setFeedbackAlert({
+        type: 'error',
+        message: 'ERROR: Debe ingresar el sustento detallado de la nota para el XML de SUNAT.',
+      });
+      return;
+    }
+
+    if (manualNoteModal.noteType === '07') {
+      if (manualNoteModal.remainingBalance <= 0.009) {
+        setFeedbackAlert({
+          type: 'error',
+          message: `ERROR FISCAL: El comprobante ${doc.full_number} ya fue totalmente liquidado/anulado (Saldo S/ 0.00). No se pueden emitir más notas de crédito.`,
+        });
+        return;
+      }
+
+      if (manualNoteModal.reasonCode === '03') {
+        // Corrección de descripción: No altera monto contable
+        if (manualNoteModal.amount !== 0) {
+          manualNoteModal.amount = 0;
+        }
+      } else if (['01', '02', '06'].includes(manualNoteModal.reasonCode)) {
+        // Anulación / Devolución total: debe ser por el saldo remanente exacto
+        manualNoteModal.amount = manualNoteModal.remainingBalance;
+      } else {
+        if (manualNoteModal.amount <= 0) {
+          setFeedbackAlert({
+            type: 'error',
+            message: 'ERROR: El importe de la Nota de Crédito debe ser mayor a S/ 0.00.',
+          });
+          return;
+        }
+        if (manualNoteModal.amount > manualNoteModal.remainingBalance + 0.009) {
+          setFeedbackAlert({
+            type: 'error',
+            message: `ERROR: El importe de la Nota de Crédito (S/ ${manualNoteModal.amount.toFixed(2)}) supera el saldo tributario disponible (S/ ${manualNoteModal.remainingBalance.toFixed(2)}).`,
+          });
+          return;
+        }
+      }
+    } else if (manualNoteModal.noteType === '08') {
+      if (manualNoteModal.remainingBalance <= 0.009) {
+        setFeedbackAlert({
+          type: 'error',
+          message: `ERROR FISCAL: Normativa SUNAT prohíbe emitir Notas de Débito sobre comprobantes totalmente anulados o sin saldo tributario.`,
+        });
+        return;
+      }
+      if (manualNoteModal.amount <= 0) {
+        setFeedbackAlert({
+          type: 'error',
+          message: 'ERROR: El importe de la Nota de Débito debe ser mayor a S/ 0.00.',
+        });
+        return;
+      }
+    }
+
+    setManualNoteModal(prev => ({ ...prev, loading: true }));
 
     try {
       const res = await fetch(`${API_BASE}/documents/${doc.id}/manual-note`, {
@@ -1807,7 +2208,7 @@ export function App() {
         body: JSON.stringify({
           note_type: manualNoteModal.noteType,
           reason_code: manualNoteModal.reasonCode,
-          reason_text: manualNoteModal.reasonText,
+          reason_text: manualNoteModal.reasonText.trim(),
           amount: Number(manualNoteModal.amount),
           issue_date: manualNoteModal.issueDate,
         }),
@@ -2027,25 +2428,26 @@ export function App() {
 
   const totals = calculateTotals();
 
-  // Métricas calculadas para Dashboard
-  const totalInvoiced = documents.reduce((acc, d) => acc + (Number(d.total_amount) || 0), 0);
-  const acceptedCount = documents.filter(d => d.status.includes('ACCEPTED')).length;
+  // Métricas calculadas para Dashboard (Totalmente seguras contra nulos)
+  const safeDocs = Array.isArray(documents) ? documents.filter(Boolean) : [];
+  const totalInvoiced = safeDocs.reduce((acc, d) => acc + (Number(d.total_amount) || 0), 0);
+  const acceptedCount = safeDocs.filter(d => (d.status || '').includes('ACCEPTED')).length;
   const queuedCount = Math.max(
-    documents.filter(d => d.status === 'QUEUED' || d.status === 'SENDING').length,
-    Number(queueStats.counts?.find((c: any) => c.status === 'PENDING')?.count || queueStats.counts?.find((c: any) => c.status === 'PENDING')?._count?.id || queueStats.queuedDocsCount || 0),
+    safeDocs.filter(d => d.status === 'QUEUED' || d.status === 'SENDING').length,
+    Number(queueStats?.counts?.find((c: any) => c.status === 'PENDING')?.count || queueStats?.counts?.find((c: any) => c.status === 'PENDING')?._count?.id || queueStats?.queuedDocsCount || 0),
   );
-  const rejectedCount = documents.filter(d => d.status === 'REJECTED' || d.status === 'FAILED_RETRY').length;
-  const successRate = documents.length > 0 ? Math.round((acceptedCount / documents.length) * 100) : 100;
+  const rejectedCount = safeDocs.filter(d => d.status === 'REJECTED' || d.status === 'FAILED_RETRY').length;
+  const successRate = safeDocs.length > 0 ? Math.round((acceptedCount / safeDocs.length) * 100) : 100;
 
   // Métricas Analíticas Avanzadas por Tipo de Comprobante
-  const facturasList = documents.filter(d => d.document_type === '01');
+  const facturasList = safeDocs.filter(d => d.document_type === '01');
   const facturasTotal = facturasList.reduce((acc, d) => acc + (Number(d.total_amount) || 0), 0);
-  const boletasList = documents.filter(d => d.document_type === '03');
+  const boletasList = safeDocs.filter(d => d.document_type === '03');
   const boletasTotal = boletasList.reduce((acc, d) => acc + (Number(d.total_amount) || 0), 0);
-  const notasList = documents.filter(d => d.document_type === '07');
+  const notasList = safeDocs.filter(d => d.document_type === '07');
   const notasTotal = notasList.reduce((acc, d) => acc + (Number(d.total_amount) || 0), 0);
-  const totalIgvAcumulado = documents.reduce((acc, d) => acc + (Number(d.total_igv) || 0), 0);
-  const totalGravadaAcumulado = documents.reduce((acc, d) => acc + (Number(d.total_gravada) || 0), 0);
+  const totalIgvAcumulado = safeDocs.reduce((acc, d) => acc + (Number(d.total_igv) || 0), 0);
+  const totalGravadaAcumulado = safeDocs.reduce((acc, d) => acc + (Number(d.total_gravada) || 0), 0);
 
   // --------------------------------------------------------------------------
   // CONTROL DE ACCESO: Si no está autenticado como Admin, mostrar Login
@@ -2198,71 +2600,64 @@ export function App() {
       <nav className="border-b border-slate-200 bg-white px-6 flex gap-1 overflow-x-auto shadow-2xs">
         <button
           onClick={() => setActiveTab('dashboard')}
-          className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${
-            activeTab === 'dashboard'
+          className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${activeTab === 'dashboard'
               ? 'border-indigo-600 text-indigo-600 bg-indigo-50/40'
               : 'border-transparent text-slate-600 hover:text-slate-900'
-          }`}
+            }`}
         >
           <TrendingUp className="w-4 h-4" /> Panel General
         </button>
         <button
           onClick={() => setActiveTab('emitir')}
-          className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${
-            activeTab === 'emitir'
+          className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${activeTab === 'emitir'
               ? 'border-indigo-600 text-indigo-600 bg-indigo-50/40'
               : 'border-transparent text-slate-600 hover:text-slate-900'
-          }`}
+            }`}
         >
           <Send className="w-4 h-4" /> Emisión Universal (POS)
         </button>
         <button
           onClick={() => { setActiveTab('documentos'); fetchDocuments(); }}
-          className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${
-            activeTab === 'documentos'
+          className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${activeTab === 'documentos'
               ? 'border-indigo-600 text-indigo-600 bg-indigo-50/40'
               : 'border-transparent text-slate-600 hover:text-slate-900'
-          }`}
+            }`}
         >
           <FileText className="w-4 h-4" /> Comprobantes ({documents.length})
         </button>
         <button
           onClick={() => { setActiveTab('guias'); fetchDocuments(); }}
-          className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${
-            activeTab === 'guias'
+          className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${activeTab === 'guias'
               ? 'border-indigo-600 text-indigo-600 bg-indigo-50/40'
               : 'border-transparent text-slate-600 hover:text-slate-900'
-          }`}
+            }`}
         >
           <Truck className="w-4 h-4 text-indigo-600" /> Guías de Remisión ({documents.filter(d => d.document_type === '09').length})
         </button>
         <button
           onClick={() => { setActiveTab('empresas'); fetchCompanies(); }}
-          className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${
-            activeTab === 'empresas'
+          className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${activeTab === 'empresas'
               ? 'border-indigo-600 text-indigo-600 bg-indigo-50/40'
               : 'border-transparent text-slate-600 hover:text-slate-900'
-          }`}
+            }`}
         >
           <Building2 className="w-4 h-4" /> Empresas & Negocios ({companies.length})
         </button>
         <button
           onClick={() => setActiveTab('usuarios')}
-          className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${
-            activeTab === 'usuarios'
+          className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${activeTab === 'usuarios'
               ? 'border-indigo-600 text-indigo-600 bg-indigo-50/40'
               : 'border-transparent text-slate-600 hover:text-slate-900'
-          }`}
+            }`}
         >
           <Users className="w-4 h-4" /> Usuarios & Accesos
         </button>
         <button
           onClick={() => { setActiveTab('colas'); fetchQueueStats(); }}
-          className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${
-            activeTab === 'colas'
+          className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${activeTab === 'colas'
               ? 'border-indigo-600 text-indigo-600 bg-indigo-50/40'
               : 'border-transparent text-slate-600 hover:text-slate-900'
-          }`}
+            }`}
         >
           <Clock className="w-4 h-4" /> Colas Transaccionales
           {queuedCount > 0 && (
@@ -2273,31 +2668,28 @@ export function App() {
         </button>
         <button
           onClick={() => setActiveTab('api')}
-          className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${
-            activeTab === 'api'
+          className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${activeTab === 'api'
               ? 'border-indigo-600 text-indigo-600 bg-indigo-50/40'
               : 'border-transparent text-slate-600 hover:text-slate-900'
-          }`}
+            }`}
         >
           <Code2 className="w-4 h-4" /> Documentación API & SDKs
         </button>
         <button
           onClick={() => setActiveTab('consola')}
-          className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${
-            activeTab === 'consola'
+          className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${activeTab === 'consola'
               ? 'border-indigo-600 text-indigo-600 bg-indigo-50/40'
               : 'border-transparent text-slate-600 hover:text-slate-900'
-          }`}
+            }`}
         >
           <ShieldCheck className="w-4 h-4" /> Sandbox CCOFACT
         </button>
         <button
           onClick={() => setActiveTab('guia_sunat')}
-          className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${
-            activeTab === 'guia_sunat'
+          className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${activeTab === 'guia_sunat'
               ? 'border-amber-600 text-amber-600 bg-amber-50/40'
               : 'border-transparent text-slate-600 hover:text-slate-900'
-          }`}
+            }`}
         >
           <Award className="w-4 h-4 text-amber-500" /> Guía SUNAT (Beta & Prod)
         </button>
@@ -2320,7 +2712,7 @@ export function App() {
                   Emisor Activo: {currentCompany?.razon_social || 'Corporación Ccoplex'}
                 </h2>
                 <p className="text-xs text-indigo-100 max-w-2xl leading-relaxed">
-                  Emite Facturas, Boletas y Notas de Crédito/Débito con firma digital X.509 y CDR instantáneo. 
+                  Emite Facturas, Boletas y Notas de Crédito/Débito con firma digital X.509 y CDR instantáneo.
                   Conéctalo a <strong>Control Finanzas</strong> o a cualquier sistema externo con 1 solo clic.
                 </p>
               </div>
@@ -2530,13 +2922,12 @@ export function App() {
                             {doc.currency === 'USD' ? '$' : 'S/'} {Number(doc.total_amount).toFixed(2)}
                           </td>
                           <td className="py-3 px-3 text-center">
-                            <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
-                              doc.status.includes('ACCEPTED')
+                            <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${(doc.status || '').includes('ACCEPTED')
                                 ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
                                 : doc.status === 'QUEUED'
-                                ? 'bg-amber-50 text-amber-700 border border-amber-200'
-                                : 'bg-rose-50 text-rose-700 border border-rose-200'
-                            }`}>
+                                  ? 'bg-amber-50 text-amber-700 border border-amber-200'
+                                  : 'bg-rose-50 text-rose-700 border border-rose-200'
+                              }`}>
                               {doc.status}
                             </span>
                           </td>
@@ -2717,10 +3108,10 @@ export function App() {
                       />
                       <p className="text-[10px] text-slate-500 mt-1 truncate">
                         {docType === '01' ? 'Facturas: F001 a F999' :
-                         docType === '03' ? 'Boletas: B001 a B999' :
-                         docType === '07' ? (refDocType === '01' ? 'NC: FC01 a FC99' : 'NC: BC01 a BC99') :
-                         docType === '08' ? (refDocType === '01' ? 'ND: FD01 a FD99' : 'ND: BD01 a BD99') :
-                         'Guías: T001 a T999'}
+                          docType === '03' ? 'Boletas: B001 a B999' :
+                            docType === '07' ? (refDocType === '01' ? 'NC: FC01 a FC99' : 'NC: BC01 a BC99') :
+                              docType === '08' ? (refDocType === '01' ? 'ND: FD01 a FD99' : 'ND: BD01 a BD99') :
+                                'Guías: T001 a T999'}
                       </p>
                     </div>
 
@@ -2752,11 +3143,10 @@ export function App() {
                   </div>
 
                   {/* ASISTENTE TRIBUTARIO Y MONITOR DE REGLAS SUNAT EN VIVO */}
-                  <div className={`p-4 rounded-2xl border transition ${
-                    !diagnostics.isValid
+                  <div className={`p-4 rounded-2xl border transition ${!diagnostics.isValid
                       ? 'bg-rose-50/70 border-rose-200 text-rose-900'
                       : 'bg-emerald-50/70 border-emerald-200 text-emerald-900'
-                  }`}>
+                    }`}>
                     <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-2.5 border-b border-black/5">
                       <div className="flex items-center gap-2">
                         {!diagnostics.isValid ? (
@@ -2770,11 +3160,10 @@ export function App() {
                             : 'Comprobante 100% Conforme con SUNAT UBL 2.1 (Válido para Transmisión Fiscal)'}
                         </span>
                       </div>
-                      <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
-                        !diagnostics.isValid
+                      <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${!diagnostics.isValid
                           ? 'bg-rose-200 text-rose-800'
                           : 'bg-emerald-200 text-emerald-800'
-                      }`}>
+                        }`}>
                         {currentCompany?.env_mode === 'PRODUCCION' ? 'Validez Legal SIRE' : 'Homologación Beta'}
                       </span>
                     </div>
@@ -2871,11 +3260,10 @@ export function App() {
                             <button
                               type="button"
                               onClick={() => handleRefDocTypeChange('03')}
-                              className={`py-2 px-2 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer ${
-                                refDocType === '03'
+                              className={`py-2 px-2 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer ${refDocType === '03'
                                   ? 'bg-white text-indigo-700 shadow-sm border border-indigo-200'
                                   : 'text-slate-600 hover:text-slate-900'
-                              }`}
+                                }`}
                             >
                               <FileText className="w-3.5 h-3.5" />
                               <span>03 - Boleta</span>
@@ -2883,11 +3271,10 @@ export function App() {
                             <button
                               type="button"
                               onClick={() => handleRefDocTypeChange('01')}
-                              className={`py-2 px-2 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer ${
-                                refDocType === '01'
+                              className={`py-2 px-2 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer ${refDocType === '01'
                                   ? 'bg-white text-indigo-700 shadow-sm border border-indigo-200'
                                   : 'text-slate-600 hover:text-slate-900'
-                              }`}
+                                }`}
                             >
                               <Building2 className="w-3.5 h-3.5" />
                               <span>01 - Factura</span>
@@ -3001,24 +3388,25 @@ export function App() {
                               </div>
                             </div>
                           ) : sunatConsultResult.official_status === 'ACEPTADO' ? (
-                            <div className="bg-white border-2 border-emerald-500/80 rounded-2xl p-4 shadow-sm space-y-3.5">
-                              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-emerald-100 pb-3">
-                                <div className="flex items-center gap-3">
-                                  <div className="w-11 h-11 rounded-xl bg-emerald-50 text-emerald-800 border-2 border-emerald-300 flex items-center justify-center font-black text-xs shrink-0 shadow-xs">
-                                    {refDocType === '01' ? 'FAC' : 'BOL'}
+                            <div className="bg-gradient-to-b from-emerald-50/60 via-white to-white border-2 border-emerald-400 rounded-3xl p-5 shadow-lg shadow-emerald-500/10 space-y-4 ring-1 ring-emerald-500/20">
+                              {/* Header del Certificado de Consulta Oficial */}
+                              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-emerald-100 pb-3.5">
+                                <div className="flex items-center gap-3.5">
+                                  <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-emerald-500 to-teal-600 text-white shadow-md shadow-emerald-500/25 flex items-center justify-center font-black text-sm shrink-0 ring-4 ring-emerald-100">
+                                    <ShieldCheck className="w-6 h-6" />
                                   </div>
                                   <div>
-                                    <div className="flex items-center gap-2">
-                                      <span className="font-black text-slate-900 text-sm tracking-tight">
+                                    <div className="flex items-center gap-2 flex-wrap">
+                                      <span className="font-mono font-black text-slate-900 text-base tracking-tight">
                                         {sunatConsultResult.full_number}
                                       </span>
-                                      <span className="text-[10px] bg-emerald-100 text-emerald-800 font-extrabold px-2.5 py-0.5 rounded-full border border-emerald-300 flex items-center gap-1">
-                                        <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                                      <span className="inline-flex items-center gap-1.5 text-[10px] bg-emerald-100 text-emerald-800 font-black px-2.5 py-0.5 rounded-full border border-emerald-300 shadow-2xs">
+                                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
                                         SUNAT CDR: CÓDIGO {sunatConsultResult.sunat_response_code || '0'} (ACEPTADO)
                                       </span>
                                     </div>
-                                    <p className="text-xs text-slate-600 font-medium">
-                                      {sunatConsultResult.sunat_description || 'El comprobante ha sido aceptado por SUNAT.'}
+                                    <p className="text-xs text-slate-600 font-medium mt-0.5">
+                                      {sunatConsultResult.sunat_description || 'El comprobante ha sido validado y aceptado oficialmente por SUNAT.'}
                                     </p>
                                   </div>
                                 </div>
@@ -3032,7 +3420,7 @@ export function App() {
                                       title="Visualizar la representación oficial de SUNAT con código QR y constancia de recepción"
                                     >
                                       <Eye className="w-3.5 h-3.5" />
-                                      <span>👁️ Ver Boleta Oficial SUNAT</span>
+                                      <span>👁️ Ver Comprobante SUNAT</span>
                                     </button>
                                   )}
                                   <button
@@ -3050,87 +3438,100 @@ export function App() {
                               </div>
 
                               {/* Ficha de Datos Tributarios Verificados */}
-                              <div className="space-y-3">
-                                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs bg-emerald-50/40 p-3.5 rounded-xl border border-emerald-200/60">
-                                  <div>
-                                    <span className="text-slate-500 block text-[10px] font-bold uppercase tracking-wider">Cliente Adquirente</span>
-                                    <span className="font-extrabold text-slate-900 block truncate text-xs">
+                              <div className="space-y-3.5">
+                                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs bg-gradient-to-br from-slate-50 to-slate-100/60 p-4 rounded-2xl border border-slate-200/80">
+                                  <div className="space-y-1">
+                                    <span className="text-slate-400 block text-[10px] font-black uppercase tracking-wider">Cliente Adquirente</span>
+                                    <span className="font-mono font-bold text-indigo-700 text-xs bg-indigo-50 px-2 py-0.5 rounded border border-indigo-200/80 inline-block">
                                       {(linkedRefDoc?.client_doc_type || sunatConsultResult.recipient?.doc_type) === '6' ? 'RUC' : 'DNI'}{' '}
                                       {linkedRefDoc?.client_doc_number || sunatConsultResult.recipient?.doc_number || '-'}
                                     </span>
-                                    <p className="text-slate-700 truncate font-medium text-[11px]">
+                                    <p className="text-slate-800 font-extrabold text-xs truncate">
                                       {linkedRefDoc?.client_name || sunatConsultResult.recipient?.name || clientName || 'Receptor Verificado'}
                                     </p>
                                   </div>
-                                  <div>
-                                    <span className="text-slate-500 block text-[10px] font-bold uppercase tracking-wider">Fecha & Estado SUNAT</span>
-                                    <span className="font-extrabold text-slate-900 block text-xs">
+                                  <div className="space-y-1 sm:border-x sm:border-slate-200/80 sm:px-3">
+                                    <span className="text-slate-400 block text-[10px] font-black uppercase tracking-wider">Fecha & Emisión</span>
+                                    <span className="font-mono font-bold text-slate-800 text-xs block">
                                       {sunatConsultResult.issue_date || linkedRefDoc?.issue_date || 'Fecha registrada en SUNAT'}
                                     </span>
-                                    <p className="text-emerald-700 text-[11px] font-bold flex items-center gap-1">
-                                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 inline" /> CDR Oficial Aceptado
-                                    </p>
+                                    <span className="inline-flex items-center gap-1 text-[10px] text-emerald-700 font-black bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
+                                      <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                                      Constancia CDR Verificada
+                                    </span>
                                   </div>
-                                  <div className="text-left sm:text-right sm:border-l sm:border-emerald-200/80 sm:pl-3 flex flex-col justify-center">
-                                    <span className="text-slate-500 text-[10px] font-bold uppercase tracking-wider">Monto Total Declarado</span>
-                                    <span className="text-xl font-black font-mono text-emerald-700">
+                                  <div className="text-left sm:text-right flex flex-col justify-center">
+                                    <span className="text-slate-400 text-[10px] font-black uppercase tracking-wider block">Monto Total Oficial</span>
+                                    <span className="text-2xl font-black font-mono text-emerald-700">
                                       S/ {Number(sunatConsultResult.total_amount || linkedRefDoc?.total_amount || 0).toFixed(2)}
                                     </span>
                                   </div>
                                 </div>
 
                                 {/* Tabla de Bienes / Productos Vendidos */}
-                                {((linkedRefDoc?.items && linkedRefDoc.items.length > 0) || (sunatConsultResult.items && sunatConsultResult.items.length > 0)) ? (
-                                  <div className="bg-white rounded-xl border border-emerald-200 overflow-hidden shadow-2xs">
-                                    <div className="bg-emerald-50/80 px-3 py-2 border-b border-emerald-200 flex items-center justify-between">
-                                      <span className="font-bold text-[11px] text-emerald-950 uppercase tracking-wide flex items-center gap-1.5">
-                                        📦 Bienes / Productos Vendidos en este Comprobante ({sunatConsultResult.full_number})
-                                      </span>
-                                      <span className="text-[10px] font-bold text-emerald-800 bg-emerald-100 px-2 py-0.5 rounded-full border border-emerald-300">
-                                        ✓ Precargados en la Nota
-                                      </span>
-                                    </div>
-                                    <div className="overflow-x-auto">
-                                      <table className="w-full text-left text-xs">
-                                        <thead className="bg-slate-50 text-[10px] font-bold text-slate-600 uppercase border-b border-slate-100">
-                                          <tr>
-                                            <th className="px-3 py-1.5">Bien / Producto Vendido</th>
-                                            <th className="px-3 py-1.5 text-center">Cant.</th>
-                                            <th className="px-3 py-1.5 text-right">Precio Unit.</th>
-                                            <th className="px-3 py-1.5 text-right">Total</th>
-                                          </tr>
-                                        </thead>
-                                        <tbody className="divide-y divide-slate-100">
-                                          {((linkedRefDoc?.items && linkedRefDoc.items.length > 0) ? linkedRefDoc.items : sunatConsultResult.items).map((it: any, idx: number) => (
-                                            <tr key={idx} className="hover:bg-slate-50/50">
-                                              <td className="px-3 py-2 font-bold text-slate-800">{it.description}</td>
-                                              <td className="px-3 py-2 text-center font-mono font-semibold text-slate-700">{it.quantity}</td>
-                                              <td className="px-3 py-2 text-right font-mono text-slate-700">S/ {Number(it.unit_price).toFixed(2)}</td>
-                                              <td className="px-3 py-2 text-right font-mono font-bold text-emerald-700">S/ {Number(it.total || (Number(it.quantity) * Number(it.unit_price))).toFixed(2)}</td>
+                                {(() => {
+                                  const displayItems = (Array.isArray(linkedRefDoc?.items) && linkedRefDoc.items.length > 0)
+                                    ? linkedRefDoc.items
+                                    : (Array.isArray(sunatConsultResult?.items) && sunatConsultResult.items.length > 0)
+                                      ? sunatConsultResult.items
+                                      : [];
+
+                                  if (displayItems.length === 0) {
+                                    return (
+                                      <div className="p-3 bg-emerald-50/70 border border-emerald-300 rounded-2xl text-xs text-emerald-900 flex items-center justify-between font-medium">
+                                        <span>
+                                          ✓ Comprobante <b>{sunatConsultResult.full_number}</b> validado en servidores de SUNAT por un total de <b>S/ {Number(sunatConsultResult.total_amount || linkedRefDoc?.total_amount || 0).toFixed(2)}</b>.
+                                        </span>
+                                        <span className="font-extrabold text-emerald-800 bg-emerald-100 px-2.5 py-1 rounded-xl border border-emerald-300">
+                                          Listo para Emitir Nota
+                                        </span>
+                                      </div>
+                                    );
+                                  }
+
+                                  return (
+                                    <div className="bg-white rounded-2xl border border-slate-200/90 overflow-hidden shadow-xs">
+                                      <div className="bg-slate-50/80 px-4 py-2.5 border-b border-slate-200/80 flex items-center justify-between">
+                                        <span className="font-extrabold text-[11px] text-slate-800 uppercase tracking-wider flex items-center gap-1.5">
+                                          📦 Bienes / Productos Emitidos en {sunatConsultResult.full_number}
+                                        </span>
+                                        <span className="text-[10px] font-black text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200">
+                                          ✓ Precargados para Ajuste
+                                        </span>
+                                      </div>
+                                      <div className="overflow-x-auto">
+                                        <table className="w-full text-left text-xs">
+                                          <thead className="bg-slate-50/50 text-[10px] font-extrabold text-slate-400 uppercase tracking-wider border-b border-slate-100">
+                                            <tr>
+                                              <th className="px-4 py-2">Descripción del Ítem</th>
+                                              <th className="px-4 py-2 text-center">Cant.</th>
+                                              <th className="px-4 py-2 text-right">Precio Unit.</th>
+                                              <th className="px-4 py-2 text-right">Importe Total</th>
                                             </tr>
-                                          ))}
-                                        </tbody>
-                                        <tfoot className="bg-emerald-50/40 border-t border-emerald-200 font-bold text-xs">
-                                          <tr>
-                                            <td colSpan={3} className="px-3 py-2 text-right text-slate-700 uppercase font-black">Total Declarado:</td>
-                                            <td className="px-3 py-2 text-right font-mono font-black text-emerald-800 text-sm">
-                                              S/ {Number(sunatConsultResult.total_amount || linkedRefDoc?.total_amount || 0).toFixed(2)}
-                                            </td>
-                                          </tr>
-                                        </tfoot>
-                                      </table>
+                                          </thead>
+                                          <tbody className="divide-y divide-slate-100">
+                                            {displayItems.map((it: any, idx: number) => (
+                                              <tr key={idx} className="hover:bg-slate-50/60 transition">
+                                                <td className="px-4 py-2.5 font-bold text-slate-800">{it.description || it.name || 'Producto'}</td>
+                                                <td className="px-4 py-2.5 text-center font-mono font-bold text-slate-700">{it.quantity || 1}</td>
+                                                <td className="px-4 py-2.5 text-right font-mono text-slate-600">S/ {Number(it.unit_price || it.price || 0).toFixed(2)}</td>
+                                                <td className="px-4 py-2.5 text-right font-mono font-black text-emerald-700">S/ {Number(it.total || (Number(it.quantity || 1) * Number(it.unit_price || it.price || 0))).toFixed(2)}</td>
+                                              </tr>
+                                            ))}
+                                          </tbody>
+                                          <tfoot className="bg-slate-50/80 border-t border-slate-200 font-bold text-xs">
+                                            <tr>
+                                              <td colSpan={3} className="px-4 py-2.5 text-right text-slate-700 uppercase font-black text-[11px] tracking-wider">Total Declarado en Comprobante:</td>
+                                              <td className="px-4 py-2.5 text-right font-mono font-black text-emerald-800 text-sm">
+                                                S/ {Number(sunatConsultResult.total_amount || linkedRefDoc?.total_amount || 0).toFixed(2)}
+                                              </td>
+                                            </tr>
+                                          </tfoot>
+                                        </table>
+                                      </div>
                                     </div>
-                                  </div>
-                                ) : (
-                                  <div className="p-2.5 bg-emerald-50/70 border border-emerald-300 rounded-xl text-[11px] text-emerald-900 flex items-center justify-between">
-                                    <span>
-                                      ✓ Comprobante <b>{sunatConsultResult.full_number}</b> verificado en servidores de SUNAT por un total de <b>S/ {Number(sunatConsultResult.total_amount || 0).toFixed(2)}</b>.
-                                    </span>
-                                    <span className="font-bold text-emerald-800">
-                                      Listo para emitir Nota
-                                    </span>
-                                  </div>
-                                )}
+                                  );
+                                })()}
                               </div>
                             </div>
                           ) : sunatConsultResult.official_status === 'EN_PROCESO' ? (
@@ -3160,782 +3561,941 @@ export function App() {
                         </div>
                       )}
 
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
-                    <div>
-                      <label className="block text-slate-800 font-bold mb-1">
-                        Código de Motivo SUNAT ({docType === '07' ? 'Catálogo 09 NC' : 'Catálogo 10 ND'}) *
-                      </label>
-                      {docType === '07' ? (
-                        <select
-                          value={refReasonCode}
-                          onChange={(e) => {
-                            setRefReasonCode(e.target.value);
-                            const mapDescs: Record<string, string> = {
-                              '01': 'Anulación de la operación',
-                              '02': 'Anulación por error en el RUC',
-                              '03': 'Corrección por error en la descripción',
-                              '04': 'Descuento global',
-                              '05': 'Descuento por ítem',
-                              '06': 'Devolución total',
-                              '07': 'Devolución por ítem',
-                              '08': 'Bonificación',
-                              '09': 'Disminución en el valor',
-                            };
-                            if (mapDescs[e.target.value]) setRefReasonDesc(mapDescs[e.target.value]);
-                          }}
-                          className="w-full bg-white border border-amber-300 rounded-xl px-3 py-2 text-slate-900 font-semibold outline-none focus:ring-2 focus:ring-amber-400"
-                        >
-                          <option value="01">01 - Anulación de la operación</option>
-                          <option value="02">02 - Anulación por error en el RUC</option>
-                          <option value="03">03 - Corrección por error en la descripción</option>
-                          <option value="04">04 - Descuento global</option>
-                          <option value="05">05 - Descuento por ítem</option>
-                          <option value="06">06 - Devolución total</option>
-                          <option value="07">07 - Devolución por ítem</option>
-                          <option value="08">08 - Bonificación</option>
-                          <option value="09">09 - Disminución en el valor</option>
-                        </select>
-                      ) : (
-                        <select
-                          value={refReasonCode}
-                          onChange={(e) => {
-                            setRefReasonCode(e.target.value);
-                            const mapDescs: Record<string, string> = {
-                              '01': 'Intereses por mora',
-                              '02': 'Aumento en el valor',
-                              '03': 'Penalidades / otros conceptos',
-                            };
-                            if (mapDescs[e.target.value]) setRefReasonDesc(mapDescs[e.target.value]);
-                          }}
-                          className="w-full bg-white border border-amber-300 rounded-xl px-3 py-2 text-slate-900 font-semibold outline-none focus:ring-2 focus:ring-amber-400"
-                        >
-                          <option value="01">01 - Intereses por mora</option>
-                          <option value="02">02 - Aumento en el valor</option>
-                          <option value="03">03 - Penalidades / otros conceptos</option>
-                        </select>
-                      )}
-                      <p className="text-[10px] text-amber-800 mt-1">
-                        Causa tributaria formal estandarizada por SUNAT
-                      </p>
-                    </div>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+                        <div>
+                          <label className="block text-slate-800 font-bold mb-1">
+                            Código de Motivo SUNAT ({docType === '07' ? 'Catálogo 09 NC' : 'Catálogo 10 ND'}) *
+                          </label>
+                          {docType === '07' ? (
+                            <select
+                              value={refReasonCode}
+                              onChange={(e) => {
+                                setRefReasonCode(e.target.value);
+                                const mapDescs: Record<string, string> = {
+                                  '01': 'Anulación de la operación',
+                                  '02': 'Anulación por error en el RUC',
+                                  '03': 'Corrección por error en la descripción',
+                                  '04': 'Descuento global',
+                                  '05': 'Descuento por ítem',
+                                  '06': 'Devolución total',
+                                  '07': 'Devolución por ítem',
+                                  '08': 'Bonificación',
+                                  '09': 'Disminución en el valor',
+                                };
+                                if (mapDescs[e.target.value]) setRefReasonDesc(mapDescs[e.target.value]);
+                              }}
+                              className="w-full bg-white border border-amber-300 rounded-xl px-3 py-2 text-slate-900 font-semibold outline-none focus:ring-2 focus:ring-amber-400"
+                            >
+                              <option value="01">01 - Anulación de la operación</option>
+                              <option value="02">02 - Anulación por error en el RUC</option>
+                              <option value="03">03 - Corrección por error en la descripción</option>
+                              <option value="04">04 - Descuento global</option>
+                              <option value="05">05 - Descuento por ítem</option>
+                              <option value="06">06 - Devolución total</option>
+                              <option value="07">07 - Devolución por ítem</option>
+                              <option value="08">08 - Bonificación</option>
+                              <option value="09">09 - Disminución en el valor</option>
+                            </select>
+                          ) : (
+                            <select
+                              value={refReasonCode}
+                              onChange={(e) => {
+                                setRefReasonCode(e.target.value);
+                                const mapDescs: Record<string, string> = {
+                                  '01': 'Intereses por mora',
+                                  '02': 'Aumento en el valor',
+                                  '03': 'Penalidades / otros conceptos',
+                                };
+                                if (mapDescs[e.target.value]) setRefReasonDesc(mapDescs[e.target.value]);
+                              }}
+                              className="w-full bg-white border border-amber-300 rounded-xl px-3 py-2 text-slate-900 font-semibold outline-none focus:ring-2 focus:ring-amber-400"
+                            >
+                              <option value="01">01 - Intereses por mora</option>
+                              <option value="02">02 - Aumento en el valor</option>
+                              <option value="03">03 - Penalidades / otros conceptos</option>
+                            </select>
+                          )}
+                          <p className="text-[10px] text-amber-800 mt-1">
+                            Causa tributaria formal estandarizada por SUNAT
+                          </p>
+                        </div>
 
-                    <div>
-                      <label className="block text-slate-800 font-bold mb-1">
-                        Sustento Detallado del Motivo (Aparece en XML y PDF) *
-                      </label>
+                        <div>
+                          <label className="block text-slate-800 font-bold mb-1">
+                            Sustento Detallado del Motivo (Aparece en XML y PDF) *
+                          </label>
+                          <input
+                            type="text"
+                            value={refReasonDesc}
+                            onChange={(e) => setRefReasonDesc(e.target.value)}
+                            className="w-full bg-white border border-amber-300 rounded-xl px-3 py-2 text-slate-900 outline-none focus:ring-2 focus:ring-amber-400"
+                            placeholder="Ej: Anulación de la venta por devolución de mercadería"
+                            required
+                          />
+                          <p className="text-[10px] text-amber-800 mt-1">
+                            Descripción legible que se transmitirá a SUNAT y al cliente
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* SECCIÓN GUÍA DE REMISIÓN REMITENTE (09) */}
+                  {docType === '09' && (
+                    <div className="border border-indigo-200 bg-indigo-50/40 rounded-2xl p-5 space-y-4">
+                      <div className="flex items-center gap-2 text-indigo-900 font-bold text-xs uppercase tracking-wider">
+                        <Truck className="w-4 h-4 text-indigo-600" />
+                        <span>Datos de Traslado y Despacho (Guía de Remisión Remitente - UBL 2.1)</span>
+                      </div>
+
+                      {/* Parámetros Básicos del Traslado */}
+                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
+                        <div>
+                          <label className="block text-slate-700 font-semibold mb-1">Motivo de Traslado</label>
+                          <select
+                            value={motivoTraslado}
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              setMotivoTraslado(val);
+                              const labels: Record<string, string> = {
+                                '01': 'Venta',
+                                '02': 'Compra',
+                                '04': 'Traslado entre establecimientos de la misma empresa',
+                                '08': 'Importación',
+                                '09': 'Exportación',
+                                '13': 'Otros traslados',
+                              };
+                              setMotivoTrasladoDesc(labels[val] || 'Venta');
+                            }}
+                            className="w-full bg-white border border-indigo-200 rounded-xl px-3 py-2 text-slate-900 font-semibold outline-none"
+                          >
+                            <option value="01">01 - Venta</option>
+                            <option value="02">02 - Compra</option>
+                            <option value="04">04 - Traslado entre locales</option>
+                            <option value="08">08 - Importación</option>
+                            <option value="09">09 - Exportación</option>
+                            <option value="13">13 - Otros motivos</option>
+                          </select>
+                        </div>
+
+                        <div>
+                          <label className="block text-slate-700 font-semibold mb-1">Modalidad de Traslado</label>
+                          <select
+                            value={modalidadTraslado}
+                            onChange={(e) => setModalidadTraslado(e.target.value as any)}
+                            className="w-full bg-white border border-indigo-200 rounded-xl px-3 py-2 text-slate-900 font-semibold outline-none"
+                          >
+                            <option value="02">02 - Privado (Vehículo y Conductor Propio)</option>
+                            <option value="01">01 - Público (Empresa Transportista)</option>
+                          </select>
+                        </div>
+
+                        <div>
+                          <label className="block text-slate-700 font-semibold mb-1">Fecha Inicio de Traslado</label>
+                          <input
+                            type="date"
+                            value={fechaInicioTraslado}
+                            onChange={(e) => setFechaInicioTraslado(e.target.value)}
+                            className="w-full bg-white border border-indigo-200 rounded-xl px-3 py-2 text-slate-900 font-semibold outline-none"
+                            required
+                          />
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-2">
+                          <div>
+                            <label className="block text-slate-700 font-semibold mb-1">Peso (KGM)</label>
+                            <input
+                              type="number"
+                              step="0.01"
+                              min="0.01"
+                              value={pesoBrutoTotal}
+                              onChange={(e) => setPesoBrutoTotal(parseFloat(e.target.value) || 0)}
+                              className="w-full bg-white border border-indigo-200 rounded-xl px-3 py-2 font-mono font-bold text-slate-900 outline-none"
+                              required
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-slate-700 font-semibold mb-1">N° Bultos</label>
+                            <input
+                              type="number"
+                              min="1"
+                              value={numeroBultos}
+                              onChange={(e) => setNumeroBultos(parseInt(e.target.value, 10) || 1)}
+                              className="w-full bg-white border border-indigo-200 rounded-xl px-3 py-2 font-mono font-bold text-slate-900 outline-none"
+                              required
+                            />
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Puntos de Partida y Llegada */}
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs pt-1">
+                        <div className="bg-white/90 p-3.5 rounded-xl border border-indigo-100 space-y-2">
+                          <div className="flex items-center gap-1.5 text-indigo-700 font-bold">
+                            <MapPin className="w-3.5 h-3.5 text-indigo-600" />
+                            <span>Punto de Partida (Origen de la Carga)</span>
+                          </div>
+                          <div className="grid grid-cols-3 gap-2">
+                            <div className="col-span-1">
+                              <label className="block text-[11px] text-slate-500 font-medium mb-1">Ubigeo (6 dígitos)</label>
+                              <input
+                                type="text"
+                                maxLength={6}
+                                value={puntoPartidaUbigeo}
+                                onChange={(e) => setPuntoPartidaUbigeo(e.target.value.replace(/\D/g, ''))}
+                                placeholder="150101"
+                                className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 font-mono text-xs text-slate-900 outline-none"
+                                required
+                              />
+                            </div>
+                            <div className="col-span-2">
+                              <label className="block text-[11px] text-slate-500 font-medium mb-1">Dirección de Partida</label>
+                              <input
+                                type="text"
+                                value={puntoPartidaDireccion}
+                                onChange={(e) => setPuntoPartidaDireccion(e.target.value)}
+                                placeholder="Av. Ejemplo 123, Lima"
+                                className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-slate-900 outline-none"
+                                required
+                              />
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="bg-white/90 p-3.5 rounded-xl border border-indigo-100 space-y-2">
+                          <div className="flex items-center gap-1.5 text-indigo-700 font-bold">
+                            <MapPin className="w-3.5 h-3.5 text-emerald-600" />
+                            <span>Punto de Llegada (Destino de la Carga)</span>
+                          </div>
+                          <div className="grid grid-cols-3 gap-2">
+                            <div className="col-span-1">
+                              <label className="block text-[11px] text-slate-500 font-medium mb-1">Ubigeo (6 dígitos)</label>
+                              <input
+                                type="text"
+                                maxLength={6}
+                                value={puntoLlegadaUbigeo}
+                                onChange={(e) => setPuntoLlegadaUbigeo(e.target.value.replace(/\D/g, ''))}
+                                placeholder="150101"
+                                className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 font-mono text-xs text-slate-900 outline-none"
+                                required
+                              />
+                            </div>
+                            <div className="col-span-2">
+                              <label className="block text-[11px] text-slate-500 font-medium mb-1">Dirección de Llegada</label>
+                              <input
+                                type="text"
+                                value={puntoLlegadaDireccion}
+                                onChange={(e) => setPuntoLlegadaDireccion(e.target.value)}
+                                placeholder="Av. Destino 456, Callao"
+                                className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-slate-900 outline-none"
+                                required
+                              />
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Operador de Transporte según Modalidad */}
+                      {modalidadTraslado === '01' ? (
+                        <div className="bg-white/90 p-3.5 rounded-xl border border-indigo-100 space-y-2 text-xs">
+                          <div className="flex items-center gap-1.5 text-indigo-700 font-bold">
+                            <Truck className="w-3.5 h-3.5 text-indigo-600" />
+                            <span>Datos de la Empresa Transportista (Transporte Público)</span>
+                          </div>
+                          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                            <div>
+                              <label className="block text-[11px] text-slate-500 font-medium mb-1">RUC Transportista (11 dígitos)</label>
+                              <input
+                                type="text"
+                                maxLength={11}
+                                value={transportistaDoc}
+                                onChange={(e) => setTransportistaDoc(e.target.value.replace(/\D/g, ''))}
+                                placeholder="20123456789"
+                                className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 font-mono text-xs text-slate-900 outline-none"
+                                required
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-[11px] text-slate-500 font-medium mb-1">Razón Social Transportista</label>
+                              <input
+                                type="text"
+                                value={transportistaNombre}
+                                onChange={(e) => setTransportistaNombre(e.target.value)}
+                                placeholder="TRANSPORTES LOGISTICOS S.A.C."
+                                className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-slate-900 outline-none"
+                                required
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-[11px] text-slate-500 font-medium mb-1">N° Registro MTC (Opcional)</label>
+                              <input
+                                type="text"
+                                value={transportistaMtc}
+                                onChange={(e) => setTransportistaMtc(e.target.value)}
+                                placeholder="MTC-12345"
+                                className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-slate-900 outline-none"
+                              />
+                            </div>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="bg-white/90 p-3.5 rounded-xl border border-indigo-100 space-y-2 text-xs">
+                          <div className="flex items-center gap-1.5 text-indigo-700 font-bold">
+                            <Users className="w-3.5 h-3.5 text-indigo-600" />
+                            <span>Datos del Conductor y Vehículo (Transporte Privado)</span>
+                          </div>
+                          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
+                            <div>
+                              <label className="block text-[11px] text-slate-500 font-medium mb-1">DNI Conductor (8 dígitos)</label>
+                              <input
+                                type="text"
+                                maxLength={8}
+                                value={conductorDoc}
+                                onChange={(e) => setConductorDoc(e.target.value.replace(/\D/g, ''))}
+                                placeholder="45678901"
+                                className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 font-mono text-xs text-slate-900 outline-none"
+                                required
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-[11px] text-slate-500 font-medium mb-1">Nombres y Apellidos</label>
+                              <input
+                                type="text"
+                                value={conductorNombre}
+                                onChange={(e) => setConductorNombre(e.target.value)}
+                                placeholder="JUAN PEREZ CHOQUE"
+                                className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-slate-900 outline-none"
+                                required
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-[11px] text-slate-500 font-medium mb-1">Licencia de Conducir</label>
+                              <input
+                                type="text"
+                                value={conductorLicencia}
+                                onChange={(e) => setConductorLicencia(e.target.value.toUpperCase())}
+                                placeholder="Q45678901"
+                                className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 font-mono text-xs text-slate-900 outline-none"
+                                required
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-[11px] text-slate-500 font-medium mb-1">Placa del Vehículo</label>
+                              <input
+                                type="text"
+                                value={vehiculoPlaca}
+                                onChange={(e) => setVehiculoPlaca(e.target.value.toUpperCase())}
+                                placeholder="ABC-123"
+                                className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 font-mono font-bold text-xs text-slate-900 outline-none"
+                                required
+                              />
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Idempotencia Opcional */}
+                  <div className="bg-slate-50 p-3 rounded-xl border border-slate-200 flex items-center gap-3">
+                    <Hash className="w-5 h-5 text-indigo-600 shrink-0" />
+                    <div className="flex-1">
+                      <div className="text-xs font-bold text-slate-800">Llave de Idempotencia (Idempotency-Key)</div>
                       <input
                         type="text"
-                        value={refReasonDesc}
-                        onChange={(e) => setRefReasonDesc(e.target.value)}
-                        className="w-full bg-white border border-amber-300 rounded-xl px-3 py-2 text-slate-900 outline-none focus:ring-2 focus:ring-amber-400"
-                        placeholder="Ej: Anulación de la venta por devolución de mercadería"
-                        required
-                      />
-                      <p className="text-[10px] text-amber-800 mt-1">
-                        Descripción legible que se transmitirá a SUNAT y al cliente
-                      </p>
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              {/* SECCIÓN GUÍA DE REMISIÓN REMITENTE (09) */}
-              {docType === '09' && (
-                <div className="border border-indigo-200 bg-indigo-50/40 rounded-2xl p-5 space-y-4">
-                  <div className="flex items-center gap-2 text-indigo-900 font-bold text-xs uppercase tracking-wider">
-                    <Truck className="w-4 h-4 text-indigo-600" />
-                    <span>Datos de Traslado y Despacho (Guía de Remisión Remitente - UBL 2.1)</span>
-                  </div>
-
-                  {/* Parámetros Básicos del Traslado */}
-                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
-                    <div>
-                      <label className="block text-slate-700 font-semibold mb-1">Motivo de Traslado</label>
-                      <select
-                        value={motivoTraslado}
-                        onChange={(e) => {
-                          const val = e.target.value;
-                          setMotivoTraslado(val);
-                          const labels: Record<string, string> = {
-                            '01': 'Venta',
-                            '02': 'Compra',
-                            '04': 'Traslado entre establecimientos de la misma empresa',
-                            '08': 'Importación',
-                            '09': 'Exportación',
-                            '13': 'Otros traslados',
-                          };
-                          setMotivoTrasladoDesc(labels[val] || 'Venta');
-                        }}
-                        className="w-full bg-white border border-indigo-200 rounded-xl px-3 py-2 text-slate-900 font-semibold outline-none"
-                      >
-                        <option value="01">01 - Venta</option>
-                        <option value="02">02 - Compra</option>
-                        <option value="04">04 - Traslado entre locales</option>
-                        <option value="08">08 - Importación</option>
-                        <option value="09">09 - Exportación</option>
-                        <option value="13">13 - Otros motivos</option>
-                      </select>
-                    </div>
-
-                    <div>
-                      <label className="block text-slate-700 font-semibold mb-1">Modalidad de Traslado</label>
-                      <select
-                        value={modalidadTraslado}
-                        onChange={(e) => setModalidadTraslado(e.target.value as any)}
-                        className="w-full bg-white border border-indigo-200 rounded-xl px-3 py-2 text-slate-900 font-semibold outline-none"
-                      >
-                        <option value="02">02 - Privado (Vehículo y Conductor Propio)</option>
-                        <option value="01">01 - Público (Empresa Transportista)</option>
-                      </select>
-                    </div>
-
-                    <div>
-                      <label className="block text-slate-700 font-semibold mb-1">Fecha Inicio de Traslado</label>
-                      <input
-                        type="date"
-                        value={fechaInicioTraslado}
-                        onChange={(e) => setFechaInicioTraslado(e.target.value)}
-                        className="w-full bg-white border border-indigo-200 rounded-xl px-3 py-2 text-slate-900 font-semibold outline-none"
-                        required
+                        value={idempotencyKey}
+                        onChange={(e) => setIdempotencyKey(e.target.value)}
+                        placeholder="Ej. sale_order_uuid_12345 (Garantiza cero doble facturación si se reenvía)"
+                        className="w-full bg-transparent text-xs text-indigo-700 font-mono outline-none placeholder-slate-400 mt-0.5"
                       />
                     </div>
-
-                    <div className="grid grid-cols-2 gap-2">
-                      <div>
-                        <label className="block text-slate-700 font-semibold mb-1">Peso (KGM)</label>
-                        <input
-                          type="number"
-                          step="0.01"
-                          min="0.01"
-                          value={pesoBrutoTotal}
-                          onChange={(e) => setPesoBrutoTotal(parseFloat(e.target.value) || 0)}
-                          className="w-full bg-white border border-indigo-200 rounded-xl px-3 py-2 font-mono font-bold text-slate-900 outline-none"
-                          required
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-slate-700 font-semibold mb-1">N° Bultos</label>
-                        <input
-                          type="number"
-                          min="1"
-                          value={numeroBultos}
-                          onChange={(e) => setNumeroBultos(parseInt(e.target.value, 10) || 1)}
-                          className="w-full bg-white border border-indigo-200 rounded-xl px-3 py-2 font-mono font-bold text-slate-900 outline-none"
-                          required
-                        />
-                      </div>
-                    </div>
                   </div>
 
-                  {/* Puntos de Partida y Llegada */}
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs pt-1">
-                    <div className="bg-white/90 p-3.5 rounded-xl border border-indigo-100 space-y-2">
-                      <div className="flex items-center gap-1.5 text-indigo-700 font-bold">
-                        <MapPin className="w-3.5 h-3.5 text-indigo-600" />
-                        <span>Punto de Partida (Origen de la Carga)</span>
-                      </div>
-                      <div className="grid grid-cols-3 gap-2">
-                        <div className="col-span-1">
-                          <label className="block text-[11px] text-slate-500 font-medium mb-1">Ubigeo (6 dígitos)</label>
-                          <input
-                            type="text"
-                            maxLength={6}
-                            value={puntoPartidaUbigeo}
-                            onChange={(e) => setPuntoPartidaUbigeo(e.target.value.replace(/\D/g, ''))}
-                            placeholder="150101"
-                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 font-mono text-xs text-slate-900 outline-none"
-                            required
-                          />
-                        </div>
-                        <div className="col-span-2">
-                          <label className="block text-[11px] text-slate-500 font-medium mb-1">Dirección de Partida</label>
-                          <input
-                            type="text"
-                            value={puntoPartidaDireccion}
-                            onChange={(e) => setPuntoPartidaDireccion(e.target.value)}
-                            placeholder="Av. Ejemplo 123, Lima"
-                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-slate-900 outline-none"
-                            required
-                          />
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="bg-white/90 p-3.5 rounded-xl border border-indigo-100 space-y-2">
-                      <div className="flex items-center gap-1.5 text-indigo-700 font-bold">
-                        <MapPin className="w-3.5 h-3.5 text-emerald-600" />
-                        <span>Punto de Llegada (Destino de la Carga)</span>
-                      </div>
-                      <div className="grid grid-cols-3 gap-2">
-                        <div className="col-span-1">
-                          <label className="block text-[11px] text-slate-500 font-medium mb-1">Ubigeo (6 dígitos)</label>
-                          <input
-                            type="text"
-                            maxLength={6}
-                            value={puntoLlegadaUbigeo}
-                            onChange={(e) => setPuntoLlegadaUbigeo(e.target.value.replace(/\D/g, ''))}
-                            placeholder="150101"
-                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 font-mono text-xs text-slate-900 outline-none"
-                            required
-                          />
-                        </div>
-                        <div className="col-span-2">
-                          <label className="block text-[11px] text-slate-500 font-medium mb-1">Dirección de Llegada</label>
-                          <input
-                            type="text"
-                            value={puntoLlegadaDireccion}
-                            onChange={(e) => setPuntoLlegadaDireccion(e.target.value)}
-                            placeholder="Av. Destino 456, Callao"
-                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-slate-900 outline-none"
-                            required
-                          />
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Operador de Transporte según Modalidad */}
-                  {modalidadTraslado === '01' ? (
-                    <div className="bg-white/90 p-3.5 rounded-xl border border-indigo-100 space-y-2 text-xs">
-                      <div className="flex items-center gap-1.5 text-indigo-700 font-bold">
-                        <Truck className="w-3.5 h-3.5 text-indigo-600" />
-                        <span>Datos de la Empresa Transportista (Transporte Público)</span>
-                      </div>
-                      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                        <div>
-                          <label className="block text-[11px] text-slate-500 font-medium mb-1">RUC Transportista (11 dígitos)</label>
-                          <input
-                            type="text"
-                            maxLength={11}
-                            value={transportistaDoc}
-                            onChange={(e) => setTransportistaDoc(e.target.value.replace(/\D/g, ''))}
-                            placeholder="20123456789"
-                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 font-mono text-xs text-slate-900 outline-none"
-                            required
-                          />
-                        </div>
-                        <div>
-                          <label className="block text-[11px] text-slate-500 font-medium mb-1">Razón Social Transportista</label>
-                          <input
-                            type="text"
-                            value={transportistaNombre}
-                            onChange={(e) => setTransportistaNombre(e.target.value)}
-                            placeholder="TRANSPORTES LOGISTICOS S.A.C."
-                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-slate-900 outline-none"
-                            required
-                          />
-                        </div>
-                        <div>
-                          <label className="block text-[11px] text-slate-500 font-medium mb-1">N° Registro MTC (Opcional)</label>
-                          <input
-                            type="text"
-                            value={transportistaMtc}
-                            onChange={(e) => setTransportistaMtc(e.target.value)}
-                            placeholder="MTC-12345"
-                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-slate-900 outline-none"
-                          />
-                        </div>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="bg-white/90 p-3.5 rounded-xl border border-indigo-100 space-y-2 text-xs">
-                      <div className="flex items-center gap-1.5 text-indigo-700 font-bold">
-                        <Users className="w-3.5 h-3.5 text-indigo-600" />
-                        <span>Datos del Conductor y Vehículo (Transporte Privado)</span>
-                      </div>
-                      <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
-                        <div>
-                          <label className="block text-[11px] text-slate-500 font-medium mb-1">DNI Conductor (8 dígitos)</label>
-                          <input
-                            type="text"
-                            maxLength={8}
-                            value={conductorDoc}
-                            onChange={(e) => setConductorDoc(e.target.value.replace(/\D/g, ''))}
-                            placeholder="45678901"
-                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 font-mono text-xs text-slate-900 outline-none"
-                            required
-                          />
-                        </div>
-                        <div>
-                          <label className="block text-[11px] text-slate-500 font-medium mb-1">Nombres y Apellidos</label>
-                          <input
-                            type="text"
-                            value={conductorNombre}
-                            onChange={(e) => setConductorNombre(e.target.value)}
-                            placeholder="JUAN PEREZ CHOQUE"
-                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-slate-900 outline-none"
-                            required
-                          />
-                        </div>
-                        <div>
-                          <label className="block text-[11px] text-slate-500 font-medium mb-1">Licencia de Conducir</label>
-                          <input
-                            type="text"
-                            value={conductorLicencia}
-                            onChange={(e) => setConductorLicencia(e.target.value.toUpperCase())}
-                            placeholder="Q45678901"
-                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 font-mono text-xs text-slate-900 outline-none"
-                            required
-                          />
-                        </div>
-                        <div>
-                          <label className="block text-[11px] text-slate-500 font-medium mb-1">Placa del Vehículo</label>
-                          <input
-                            type="text"
-                            value={vehiculoPlaca}
-                            onChange={(e) => setVehiculoPlaca(e.target.value.toUpperCase())}
-                            placeholder="ABC-123"
-                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 font-mono font-bold text-xs text-slate-900 outline-none"
-                            required
-                          />
-                        </div>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {/* Idempotencia Opcional */}
-              <div className="bg-slate-50 p-3 rounded-xl border border-slate-200 flex items-center gap-3">
-                <Hash className="w-5 h-5 text-indigo-600 shrink-0" />
-                <div className="flex-1">
-                  <div className="text-xs font-bold text-slate-800">Llave de Idempotencia (Idempotency-Key)</div>
-                  <input
-                    type="text"
-                    value={idempotencyKey}
-                    onChange={(e) => setIdempotencyKey(e.target.value)}
-                    placeholder="Ej. sale_order_uuid_12345 (Garantiza cero doble facturación si se reenvía)"
-                    className="w-full bg-transparent text-xs text-indigo-700 font-mono outline-none placeholder-slate-400 mt-0.5"
-                  />
-                </div>
-              </div>
-
-              {/* Datos del Cliente */}
-              <div className="border border-slate-200 rounded-2xl p-4 bg-slate-50/50 space-y-4">
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                  <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wider">
-                    {docType === '09' ? 'Datos del Destinatario (Receptor de la Carga)' : 'Datos del Adquiriente / Cliente'}
-                  </h4>
-                  {linkedRefDoc && (
-                    <span className="text-[11px] text-emerald-800 bg-emerald-100/90 px-2.5 py-0.5 rounded-full font-bold border border-emerald-300 flex items-center gap-1">
-                      <Check className="w-3.5 h-3.5 text-emerald-600" />
-                      Datos cargados automáticamente desde {linkedRefDoc.full_number}
-                    </span>
-                  )}
-                </div>
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
-                  <div>
-                    <label className="block font-semibold text-slate-700 mb-1">Tipo de Documento</label>
-                    <select
-                      value={clientDocType}
-                      onChange={(e) => {
-                        const val = e.target.value;
-                        setClientDocType(val);
-                        if (val === '0') {
-                          setClientDocNumber('00000000');
-                          setClientName('CLIENTES VARIOS');
-                        } else if (clientDocNumber === '00000000') {
-                          setClientDocNumber('');
-                          setClientName('');
-                        }
-                      }}
-                      className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 font-semibold text-slate-900 outline-none cursor-pointer"
-                    >
-                      {docType === '01' ? (
-                        <option value="6">6 - R.U.C. (11 dígitos - Obligatorio para Facturas)</option>
-                      ) : (
-                        <>
-                          <option value="1">1 - D.N.I. (8 dígitos)</option>
-                          <option value="0">0 - SIN DOCUMENTO (Clientes Varios)</option>
-                          <option value="4">4 - CARNET EXTRANJERÍA</option>
-                          <option value="7">7 - PASAPORTE</option>
-                        </>
-                      )}
-                    </select>
-                  </div>
-
-                  <div>
-                    <div className="flex items-center justify-between mb-1">
-                      <label className="font-semibold text-slate-700">Número de Documento</label>
-                      <button
-                        type="button"
-                        onClick={() => handleLookupDoc()}
-                        disabled={lookingUpDoc || clientDocType === '0'}
-                        className="text-[11px] text-indigo-600 hover:text-indigo-800 font-bold flex items-center gap-1 cursor-pointer disabled:opacity-40"
-                        title="Consultar y autocompletar razón social"
-                      >
-                        {lookingUpDoc ? <RotateCw className="w-3 h-3 animate-spin" /> : <Search className="w-3 h-3" />}
-                        <span>Consultar SUNAT / RENIEC</span>
-                      </button>
-                    </div>
-                    <input
-                      type="text"
-                      value={clientDocNumber}
-                      maxLength={clientDocType === '6' ? 11 : clientDocType === '1' ? 8 : 15}
-                      disabled={clientDocType === '0'}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') {
-                          e.preventDefault();
-                          e.stopPropagation();
-                          handleLookupDoc();
-                        }
-                      }}
-                      onChange={(e) => {
-                        const maxL = clientDocType === '6' ? 11 : clientDocType === '1' ? 8 : 15;
-                        const val = e.target.value.replace(/\D/g, '').slice(0, maxL);
-                        setClientDocNumber(val);
-                        if (val.length === 11 && clientDocType === '6') {
-                          handleLookupDoc(val, '6');
-                        } else if (val.length === 8 && clientDocType === '1') {
-                          handleLookupDoc(val, '1');
-                        }
-                      }}
-                      placeholder={
-                        clientDocType === '6'
-                          ? "ej. 20601234567 (11 dígitos)"
-                          : clientDocType === '1'
-                          ? "ej. 45678901 (8 dígitos)"
-                          : clientDocType === '0'
-                          ? "00000000 (Sin Documento)"
-                          : "Número de documento"
-                      }
-                      className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 font-mono text-sm text-slate-900 outline-none focus:border-indigo-600 focus:ring-2 focus:ring-indigo-100 transition disabled:bg-slate-100"
-                      required={clientDocType !== '0'}
-                    />
-                  </div>
-
-                  <div>
-                    <div className="flex items-center justify-between mb-1">
-                      <label className="font-semibold text-slate-700">Razón Social / Nombre Completo</label>
-                      {clientSunatStatus && (
-                        <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${
-                          clientSunatStatus.estado === 'ACTIVO' && clientSunatStatus.condicion === 'HABIDO'
-                            ? 'bg-emerald-50 text-emerald-700 border-emerald-300'
-                            : 'bg-amber-50 text-amber-700 border-amber-300'
-                        }`}>
-                          SUNAT: {clientSunatStatus.estado} - {clientSunatStatus.condicion}
+                  {/* Datos del Cliente */}
+                  <div className="border border-slate-200 rounded-2xl p-4 bg-slate-50/50 space-y-4">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                      <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wider">
+                        {docType === '09' ? 'Datos del Destinatario (Receptor de la Carga)' : 'Datos del Adquiriente / Cliente'}
+                      </h4>
+                      {linkedRefDoc && (
+                        <span className="text-[11px] text-emerald-800 bg-emerald-100/90 px-2.5 py-0.5 rounded-full font-bold border border-emerald-300 flex items-center gap-1">
+                          <Check className="w-3.5 h-3.5 text-emerald-600" />
+                          Datos cargados automáticamente desde {linkedRefDoc.full_number}
                         </span>
                       )}
                     </div>
-                    <input
-                      type="text"
-                      value={clientName}
-                      onChange={(e) => setClientName(e.target.value)}
-                      placeholder={clientDocType === '0' ? "CLIENTES VARIOS" : "ej. Juan Pérez o Razón Social"}
-                      className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 text-sm text-slate-900 outline-none"
-                      required={clientDocType !== '0'}
-                    />
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
-                  <div>
-                    <label className="block font-semibold text-slate-700 mb-1">Dirección del Cliente</label>
-                    <input
-                      type="text"
-                      value={clientAddress}
-                      onChange={(e) => setClientAddress(e.target.value)}
-                      placeholder="ej. Jr. Billinghurst 123 (opcional)"
-                      className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 text-slate-900 outline-none"
-                    />
-                  </div>
-                  <div>
-                    <label className="block font-semibold text-slate-700 mb-1">Correo Electrónico (Notificación)</label>
-                    <input
-                      type="email"
-                      value={clientEmail}
-                      onChange={(e) => setClientEmail(e.target.value)}
-                      placeholder="ej. contacto@empresa.com (opcional)"
-                      className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 text-slate-900 outline-none"
-                    />
-                  </div>
-                </div>
-              </div>
-
-              {/* Items del Comprobante */}
-              <div className="border border-slate-200 rounded-2xl p-4 bg-slate-50/50 space-y-4">
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                  <div className="flex items-center gap-2">
-                    <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wider">
-                      Líneas de Detalle / Productos o Servicios
-                    </h4>
-                    {totals.hasExonerada && (
-                      <span className="text-[10px] bg-emerald-100 text-emerald-800 font-bold px-2 py-0.5 rounded-full border border-emerald-300 flex items-center gap-1">
-                        <Leaf className="w-3 h-3 text-emerald-600" /> Exonerado (0% IGV Activo)
-                      </span>
-                    )}
-                  </div>
-                  <button
-                    type="button"
-                    onClick={handleAddItem}
-                    className="flex items-center gap-1.5 bg-white hover:bg-slate-50 text-xs font-bold text-indigo-600 px-3.5 py-1.5 rounded-lg border border-slate-200 shadow-2xs transition cursor-pointer"
-                  >
-                    <Plus className="w-3.5 h-3.5" /> Agregar Línea
-                  </button>
-                </div>
-
-                {/* SELECTOR RÁPIDO DE RÉGIMEN TRIBUTARIO GLOBAL */}
-                <div className="bg-white border border-slate-200 rounded-xl p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
-                  <div className="flex items-center gap-2">
-                    <Sparkles className="w-4 h-4 text-indigo-600 shrink-0" />
-                    <div>
-                      <span className="text-xs font-bold text-slate-800 block">
-                        Régimen de IGV Rápido para el comprobante:
-                      </span>
-                      <span className="text-[10px] text-slate-500">
-                        Cambia la tasa de IGV de todas las líneas en un solo clic
-                      </span>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-1.5 flex-wrap">
-                    <button
-                      type="button"
-                      onClick={() => handleApplyGlobalAffectation('10')}
-                      className="px-2.5 py-1 rounded-lg border text-xs font-bold bg-slate-50 hover:bg-indigo-50 text-slate-700 hover:text-indigo-700 border-slate-200 transition cursor-pointer"
-                    >
-                      💼 Gravado (18%)
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleApplyGlobalAffectation('20')}
-                      className="px-2.5 py-1 rounded-lg border text-xs font-bold bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border-emerald-300 transition cursor-pointer flex items-center gap-1"
-                    >
-                      <Leaf className="w-3 h-3 text-emerald-600" /> Exonerado (0% Amazonía)
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleApplyGlobalAffectation('30')}
-                      className="px-2.5 py-1 rounded-lg border text-xs font-bold bg-purple-50 hover:bg-purple-100 text-purple-800 border-purple-300 transition cursor-pointer"
-                    >
-                      📄 Inafecto (0%)
-                    </button>
-                  </div>
-                </div>
-
-                <div className="space-y-3">
-                  {items.map((it, idx) => (
-                    <div key={idx} className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-2xs space-y-2">
-                      <div className="grid grid-cols-12 gap-3 items-center">
-                        <div className="col-span-2">
-                          <label className="block text-[10px] text-slate-500 mb-1 font-semibold">Código</label>
-                          <input
-                            type="text"
-                            value={it.code}
-                            onChange={(e) => handleItemChange(idx, 'code', e.target.value)}
-                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-slate-900"
-                            placeholder="COD-01"
-                          />
-                        </div>
-                        <div className="col-span-4">
-                          <label className="block text-[10px] text-slate-500 mb-1 font-semibold">Descripción del Ítem</label>
-                          <input
-                            type="text"
-                            value={it.description}
-                            onChange={(e) => handleItemChange(idx, 'description', e.target.value)}
-                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-slate-900"
-                            placeholder="Descripción del bien o servicio"
-                            required
-                          />
-                        </div>
-                        <div className="col-span-1">
-                          <label className="block text-[10px] text-slate-500 mb-1 font-semibold">Cant.</label>
-                          <input
-                            type="number"
-                            step="1"
-                            min="1"
-                            value={it.quantity}
-                            onChange={(e) => handleItemChange(idx, 'quantity', e.target.value)}
-                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2 py-1.5 text-xs text-right text-slate-900 font-bold"
-                            required
-                          />
-                        </div>
-                        <div className="col-span-2">
-                          <label className="block text-[10px] text-slate-500 mb-1 font-semibold">
-                            {it.igv_affectation_type === '20'
-                              ? 'Precio (Exonerado 0%)'
-                              : it.igv_affectation_type === '30'
-                              ? 'Precio (Inafecto 0%)'
-                              : 'Precio (Inc. 18% IGV)'}
-                          </label>
-                          <input
-                            type="number"
-                            step="0.01"
-                            value={it.unit_price}
-                            onChange={(e) => handleItemChange(idx, 'unit_price', e.target.value)}
-                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-right text-slate-900 font-mono font-bold"
-                            required
-                          />
-                        </div>
-                        <div className="col-span-2">
-                          <label className="block text-[10px] text-slate-500 mb-1 font-semibold">Afectación IGV SUNAT</label>
-                          <select
-                            value={it.igv_affectation_type}
-                            onChange={(e) => handleItemChange(idx, 'igv_affectation_type', e.target.value)}
-                            className={`w-full border rounded-lg px-2 py-1.5 text-xs font-bold outline-none cursor-pointer ${
-                              it.igv_affectation_type === '20'
-                                ? 'bg-emerald-50 text-emerald-800 border-emerald-300'
-                                : it.igv_affectation_type === '30'
-                                ? 'bg-purple-50 text-purple-800 border-purple-300'
-                                : 'bg-slate-50 text-slate-800 border-slate-200'
-                            }`}
-                          >
-                            <option value="10">10 - Gravado (18%)</option>
-                            <option value="20">20 - Exonerado (0%)</option>
-                            <option value="30">30 - Inafecto (0%)</option>
-                            <option value="40">40 - Exportación (0%)</option>
-                          </select>
-                        </div>
-                        <div className="col-span-1 flex justify-end pt-4">
-                          <button
-                            type="button"
-                            onClick={() => handleRemoveItem(idx)}
-                            className="p-1.5 text-slate-400 hover:text-rose-600 rounded-lg transition cursor-pointer"
-                            title="Eliminar fila"
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
-                        </div>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
+                      <div>
+                        <label className="block font-semibold text-slate-700 mb-1">Tipo de Documento</label>
+                        <select
+                          value={clientDocType}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            setClientDocType(val);
+                            if (val === '0') {
+                              setClientDocNumber('00000000');
+                              setClientName('CLIENTES VARIOS');
+                            } else if (clientDocNumber === '00000000') {
+                              setClientDocNumber('');
+                              setClientName('');
+                            }
+                          }}
+                          className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 font-semibold text-slate-900 outline-none cursor-pointer"
+                        >
+                          {docType === '01' ? (
+                            <option value="6">6 - R.U.C. (11 dígitos - Obligatorio para Facturas)</option>
+                          ) : (
+                            <>
+                              <option value="1">1 - D.N.I. (8 dígitos)</option>
+                              <option value="0">0 - SIN DOCUMENTO (Clientes Varios)</option>
+                              <option value="4">4 - CARNET EXTRANJERÍA</option>
+                              <option value="7">7 - PASAPORTE</option>
+                            </>
+                          )}
+                        </select>
                       </div>
 
-                      {/* Desglose dinámico en vivo por ítem */}
-                      <div className="flex items-center justify-between text-[11px] pt-1.5 border-t border-slate-100">
-                        <div>
-                          {it.igv_affectation_type === '20' ? (
-                            <span className="text-emerald-700 font-bold flex items-center gap-1">
-                              <Leaf className="w-3 h-3 text-emerald-600" />
-                              Operación Exonerada: Tasa 0.00% IGV • Base: {currency === 'USD' ? '$' : 'S/'} {(Number(it.quantity) * Number(it.unit_price)).toFixed(2)}
-                            </span>
-                          ) : it.igv_affectation_type === '30' ? (
-                            <span className="text-purple-700 font-bold flex items-center gap-1">
-                              Operación Inafecta: Tasa 0.00% IGV • Base: {currency === 'USD' ? '$' : 'S/'} {(Number(it.quantity) * Number(it.unit_price)).toFixed(2)}
-                            </span>
-                          ) : (
-                            <span className="text-slate-600 font-medium">
-                              Base Imponible: <span className="font-mono font-bold text-slate-800">{currency === 'USD' ? '$' : 'S/'} {((Number(it.quantity) * Number(it.unit_price)) / 1.18).toFixed(2)}</span> • IGV (18%): <span className="font-mono font-bold text-indigo-700">{currency === 'USD' ? '$' : 'S/'} {((Number(it.quantity) * Number(it.unit_price)) - ((Number(it.quantity) * Number(it.unit_price)) / 1.18)).toFixed(2)}</span>
+                      <div>
+                        <div className="flex items-center justify-between mb-1">
+                          <label className="font-semibold text-slate-700">Número de Documento</label>
+                          <button
+                            type="button"
+                            onClick={() => handleLookupDoc()}
+                            disabled={lookingUpDoc || clientDocType === '0'}
+                            className="text-[11px] text-indigo-600 hover:text-indigo-800 font-bold flex items-center gap-1 cursor-pointer disabled:opacity-40"
+                            title="Consultar y autocompletar razón social"
+                          >
+                            {lookingUpDoc ? <RotateCw className="w-3 h-3 animate-spin" /> : <Search className="w-3 h-3" />}
+                            <span>Consultar SUNAT / RENIEC</span>
+                          </button>
+                        </div>
+                        <input
+                          type="text"
+                          value={clientDocNumber}
+                          maxLength={clientDocType === '6' ? 11 : clientDocType === '1' ? 8 : 15}
+                          disabled={clientDocType === '0'}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              handleLookupDoc();
+                            }
+                          }}
+                          onChange={(e) => {
+                            const maxL = clientDocType === '6' ? 11 : clientDocType === '1' ? 8 : 15;
+                            const val = e.target.value.replace(/\D/g, '').slice(0, maxL);
+                            setClientDocNumber(val);
+                            if (val.length === 11 && clientDocType === '6') {
+                              handleLookupDoc(val, '6');
+                            } else if (val.length === 8 && clientDocType === '1') {
+                              handleLookupDoc(val, '1');
+                            }
+                          }}
+                          placeholder={
+                            clientDocType === '6'
+                              ? "ej. 20601234567 (11 dígitos)"
+                              : clientDocType === '1'
+                                ? "ej. 45678901 (8 dígitos)"
+                                : clientDocType === '0'
+                                  ? "00000000 (Sin Documento)"
+                                  : "Número de documento"
+                          }
+                          className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 font-mono text-sm text-slate-900 outline-none focus:border-indigo-600 focus:ring-2 focus:ring-indigo-100 transition disabled:bg-slate-100"
+                          required={clientDocType !== '0'}
+                        />
+                      </div>
+
+                      <div>
+                        <div className="flex items-center justify-between mb-1">
+                          <label className="font-semibold text-slate-700">Razón Social / Nombre Completo</label>
+                          {clientSunatStatus && (
+                            <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${clientSunatStatus.estado === 'ACTIVO' && clientSunatStatus.condicion === 'HABIDO'
+                                ? 'bg-emerald-50 text-emerald-700 border-emerald-300'
+                                : 'bg-amber-50 text-amber-700 border-amber-300'
+                              }`}>
+                              SUNAT: {clientSunatStatus.estado} - {clientSunatStatus.condicion}
                             </span>
                           )}
                         </div>
-                        <div className="text-slate-700 font-semibold">
-                          Total Línea: <span className="font-mono font-bold text-slate-900">{currency === 'USD' ? '$' : 'S/'} {(Number(it.quantity) * Number(it.unit_price)).toFixed(2)}</span>
+                        <input
+                          type="text"
+                          value={clientName}
+                          onChange={(e) => setClientName(e.target.value)}
+                          placeholder={clientDocType === '0' ? "CLIENTES VARIOS" : "ej. Juan Pérez o Razón Social"}
+                          className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 text-sm text-slate-900 outline-none"
+                          required={clientDocType !== '0'}
+                        />
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+                      <div>
+                        <label className="block font-semibold text-slate-700 mb-1">Dirección del Cliente</label>
+                        <input
+                          type="text"
+                          value={clientAddress}
+                          onChange={(e) => setClientAddress(e.target.value)}
+                          placeholder="ej. Jr. Billinghurst 123 (opcional)"
+                          className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 text-slate-900 outline-none"
+                        />
+                      </div>
+                      <div>
+                        <label className="block font-semibold text-slate-700 mb-1">Correo Electrónico (Notificación)</label>
+                        <input
+                          type="email"
+                          value={clientEmail}
+                          onChange={(e) => setClientEmail(e.target.value)}
+                          placeholder="ej. contacto@empresa.com (opcional)"
+                          className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 text-slate-900 outline-none"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Items del Comprobante */}
+                  <div className="border border-slate-200 rounded-2xl p-4 bg-slate-50/50 space-y-4">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wider">
+                          Líneas de Detalle / Productos o Servicios
+                        </h4>
+                        {totals.hasExonerada && (
+                          <span className="text-[10px] bg-emerald-100 text-emerald-800 font-bold px-2 py-0.5 rounded-full border border-emerald-300 flex items-center gap-1">
+                            <Leaf className="w-3 h-3 text-emerald-600" /> Exonerado (0% IGV Activo)
+                          </span>
+                        )}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={handleAddItem}
+                        className="flex items-center gap-1.5 bg-white hover:bg-slate-50 text-xs font-bold text-indigo-600 px-3.5 py-1.5 rounded-lg border border-slate-200 shadow-2xs transition cursor-pointer"
+                      >
+                        <Plus className="w-3.5 h-3.5" /> Agregar Línea
+                      </button>
+                    </div>
+
+                    {/* SELECTOR RÁPIDO DE RÉGIMEN TRIBUTARIO GLOBAL */}
+                    <div className="bg-white border border-slate-200 rounded-xl p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                      <div className="flex items-center gap-2">
+                        <Sparkles className="w-4 h-4 text-indigo-600 shrink-0" />
+                        <div>
+                          <span className="text-xs font-bold text-slate-800 block">
+                            Régimen de IGV Rápido para el comprobante:
+                          </span>
+                          <span className="text-[10px] text-slate-500">
+                            Cambia la tasa de IGV de todas las líneas en un solo clic
+                          </span>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <button
+                          type="button"
+                          onClick={() => handleApplyGlobalAffectation('10')}
+                          className="px-2.5 py-1 rounded-lg border text-xs font-bold bg-slate-50 hover:bg-indigo-50 text-slate-700 hover:text-indigo-700 border-slate-200 transition cursor-pointer"
+                        >
+                          💼 Gravado (18%)
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleApplyGlobalAffectation('20')}
+                          className="px-2.5 py-1 rounded-lg border text-xs font-bold bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border-emerald-300 transition cursor-pointer flex items-center gap-1"
+                        >
+                          <Leaf className="w-3 h-3 text-emerald-600" /> Exonerado (0% Amazonía)
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleApplyGlobalAffectation('30')}
+                          className="px-2.5 py-1 rounded-lg border text-xs font-bold bg-purple-50 hover:bg-purple-100 text-purple-800 border-purple-300 transition cursor-pointer"
+                        >
+                          📄 Inafecto (0%)
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="space-y-3">
+                      {items.map((it, idx) => (
+                        <div key={idx} className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-2xs space-y-2">
+                          <div className="grid grid-cols-12 gap-3 items-center">
+                            <div className="col-span-2">
+                              <label className="block text-[10px] text-slate-500 mb-1 font-semibold">Código</label>
+                              <input
+                                type="text"
+                                value={it.code}
+                                onChange={(e) => handleItemChange(idx, 'code', e.target.value)}
+                                className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-slate-900"
+                                placeholder="COD-01"
+                              />
+                            </div>
+                            <div className="col-span-4">
+                              <label className="block text-[10px] text-slate-500 mb-1 font-semibold">Descripción del Ítem</label>
+                              <input
+                                type="text"
+                                value={it.description}
+                                onChange={(e) => handleItemChange(idx, 'description', e.target.value)}
+                                className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-slate-900"
+                                placeholder="Descripción del bien o servicio"
+                                required
+                              />
+                            </div>
+                            <div className="col-span-1">
+                              <label className="block text-[10px] text-slate-500 mb-1 font-semibold">Cant.</label>
+                              <input
+                                type="number"
+                                step="1"
+                                min="1"
+                                value={it.quantity}
+                                onChange={(e) => handleItemChange(idx, 'quantity', e.target.value)}
+                                className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2 py-1.5 text-xs text-right text-slate-900 font-bold"
+                                required
+                              />
+                            </div>
+                            <div className="col-span-2">
+                              <label className="block text-[10px] text-slate-500 mb-1 font-semibold">
+                                {it.igv_affectation_type === '20'
+                                  ? 'Precio (Exonerado 0%)'
+                                  : it.igv_affectation_type === '30'
+                                    ? 'Precio (Inafecto 0%)'
+                                    : 'Precio (Inc. 18% IGV)'}
+                              </label>
+                              <input
+                                type="number"
+                                step="0.01"
+                                value={it.unit_price}
+                                onChange={(e) => handleItemChange(idx, 'unit_price', e.target.value)}
+                                className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-right text-slate-900 font-mono font-bold"
+                                required
+                              />
+                            </div>
+                            <div className="col-span-2">
+                              <label className="block text-[10px] text-slate-500 mb-1 font-semibold">Afectación IGV SUNAT</label>
+                              <select
+                                value={it.igv_affectation_type}
+                                onChange={(e) => handleItemChange(idx, 'igv_affectation_type', e.target.value)}
+                                className={`w-full border rounded-lg px-2 py-1.5 text-xs font-bold outline-none cursor-pointer ${it.igv_affectation_type === '20'
+                                    ? 'bg-emerald-50 text-emerald-800 border-emerald-300'
+                                    : it.igv_affectation_type === '30'
+                                      ? 'bg-purple-50 text-purple-800 border-purple-300'
+                                      : 'bg-slate-50 text-slate-800 border-slate-200'
+                                  }`}
+                              >
+                                <option value="10">10 - Gravado (18%)</option>
+                                <option value="20">20 - Exonerado (0%)</option>
+                                <option value="30">30 - Inafecto (0%)</option>
+                                <option value="40">40 - Exportación (0%)</option>
+                              </select>
+                            </div>
+                            <div className="col-span-1 flex justify-end pt-4">
+                              <button
+                                type="button"
+                                onClick={() => handleRemoveItem(idx)}
+                                className="p-1.5 text-slate-400 hover:text-rose-600 rounded-lg transition cursor-pointer"
+                                title="Eliminar fila"
+                              >
+                                <Trash2 className="w-4 h-4" />
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* Desglose dinámico en vivo por ítem */}
+                          <div className="flex items-center justify-between text-[11px] pt-1.5 border-t border-slate-100">
+                            <div>
+                              {it.igv_affectation_type === '20' ? (
+                                <span className="text-emerald-700 font-bold flex items-center gap-1">
+                                  <Leaf className="w-3 h-3 text-emerald-600" />
+                                  Operación Exonerada: Tasa 0.00% IGV • Base: {currency === 'USD' ? '$' : 'S/'} {(Number(it.quantity) * Number(it.unit_price)).toFixed(2)}
+                                </span>
+                              ) : it.igv_affectation_type === '30' ? (
+                                <span className="text-purple-700 font-bold flex items-center gap-1">
+                                  Operación Inafecta: Tasa 0.00% IGV • Base: {currency === 'USD' ? '$' : 'S/'} {(Number(it.quantity) * Number(it.unit_price)).toFixed(2)}
+                                </span>
+                              ) : (
+                                <span className="text-slate-600 font-medium">
+                                  Base Imponible: <span className="font-mono font-bold text-slate-800">{currency === 'USD' ? '$' : 'S/'} {((Number(it.quantity) * Number(it.unit_price)) / 1.18).toFixed(2)}</span> • IGV (18%): <span className="font-mono font-bold text-indigo-700">{currency === 'USD' ? '$' : 'S/'} {((Number(it.quantity) * Number(it.unit_price)) - ((Number(it.quantity) * Number(it.unit_price)) / 1.18)).toFixed(2)}</span>
+                                </span>
+                              )}
+                            </div>
+                            <div className="text-slate-700 font-semibold">
+                              Total Línea: <span className="font-mono font-bold text-slate-900">{currency === 'USD' ? '$' : 'S/'} {(Number(it.quantity) * Number(it.unit_price)).toFixed(2)}</span>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Resumen de Totales Dinámico SUNAT */}
+                    <div className="flex justify-end pt-3">
+                      <div className="bg-white p-4 rounded-2xl border border-slate-200 w-80 space-y-2 text-xs shadow-xs">
+                        {Number(totals.gravada) > 0 && (
+                          <div className="flex justify-between text-slate-600 font-medium">
+                            <span>Operación Gravada (Base):</span>
+                            <span className="font-mono font-bold text-slate-900">{currency === 'USD' ? '$' : 'S/'} {totals.gravada}</span>
+                          </div>
+                        )}
+                        {Number(totals.exonerada) > 0 && (
+                          <div className="flex justify-between text-emerald-800 font-bold bg-emerald-50 px-2 py-1 rounded-lg border border-emerald-200">
+                            <span className="flex items-center gap-1">
+                              <Leaf className="w-3 h-3 text-emerald-600" /> Op. Exonerada (0% IGV):
+                            </span>
+                            <span className="font-mono font-bold">{currency === 'USD' ? '$' : 'S/'} {totals.exonerada}</span>
+                          </div>
+                        )}
+                        {Number(totals.inafecta) > 0 && (
+                          <div className="flex justify-between text-purple-800 font-bold bg-purple-50 px-2 py-1 rounded-lg border border-purple-200">
+                            <span>Op. Inafecta (0% IGV):</span>
+                            <span className="font-mono font-bold">{currency === 'USD' ? '$' : 'S/'} {totals.inafecta}</span>
+                          </div>
+                        )}
+                        {Number(totals.gratuita) > 0 && (
+                          <div className="flex justify-between text-amber-800 font-bold bg-amber-50 px-2 py-1 rounded-lg border border-amber-200">
+                            <span>Op. Gratuita:</span>
+                            <span className="font-mono font-bold">{currency === 'USD' ? '$' : 'S/'} {totals.gratuita}</span>
+                          </div>
+                        )}
+                        <div className="flex justify-between text-slate-600 font-medium">
+                          <span>I.G.V. {Number(totals.gravada) > 0 ? '(18%)' : '(0.00)'}:</span>
+                          <span className={`font-mono font-bold ${Number(totals.igv) > 0 ? 'text-indigo-700' : 'text-slate-500'}`}>
+                            {currency === 'USD' ? '$' : 'S/'} {totals.igv}
+                          </span>
+                        </div>
+                        <div className="border-t border-slate-200 pt-2 flex justify-between font-bold text-sm text-slate-900">
+                          <span>TOTAL A PAGAR:</span>
+                          <span className="font-mono text-emerald-600">{currency === 'USD' ? '$' : 'S/'} {totals.total}</span>
                         </div>
                       </div>
                     </div>
-                  ))}
-                </div>
-
-                {/* Resumen de Totales Dinámico SUNAT */}
-                <div className="flex justify-end pt-3">
-                  <div className="bg-white p-4 rounded-2xl border border-slate-200 w-80 space-y-2 text-xs shadow-xs">
-                    {Number(totals.gravada) > 0 && (
-                      <div className="flex justify-between text-slate-600 font-medium">
-                        <span>Operación Gravada (Base):</span>
-                        <span className="font-mono font-bold text-slate-900">{currency === 'USD' ? '$' : 'S/'} {totals.gravada}</span>
-                      </div>
-                    )}
-                    {Number(totals.exonerada) > 0 && (
-                      <div className="flex justify-between text-emerald-800 font-bold bg-emerald-50 px-2 py-1 rounded-lg border border-emerald-200">
-                        <span className="flex items-center gap-1">
-                          <Leaf className="w-3 h-3 text-emerald-600" /> Op. Exonerada (0% IGV):
-                        </span>
-                        <span className="font-mono font-bold">{currency === 'USD' ? '$' : 'S/'} {totals.exonerada}</span>
-                      </div>
-                    )}
-                    {Number(totals.inafecta) > 0 && (
-                      <div className="flex justify-between text-purple-800 font-bold bg-purple-50 px-2 py-1 rounded-lg border border-purple-200">
-                        <span>Op. Inafecta (0% IGV):</span>
-                        <span className="font-mono font-bold">{currency === 'USD' ? '$' : 'S/'} {totals.inafecta}</span>
-                      </div>
-                    )}
-                    {Number(totals.gratuita) > 0 && (
-                      <div className="flex justify-between text-amber-800 font-bold bg-amber-50 px-2 py-1 rounded-lg border border-amber-200">
-                        <span>Op. Gratuita:</span>
-                        <span className="font-mono font-bold">{currency === 'USD' ? '$' : 'S/'} {totals.gratuita}</span>
-                      </div>
-                    )}
-                    <div className="flex justify-between text-slate-600 font-medium">
-                      <span>I.G.V. {Number(totals.gravada) > 0 ? '(18%)' : '(0.00)'}:</span>
-                      <span className={`font-mono font-bold ${Number(totals.igv) > 0 ? 'text-indigo-700' : 'text-slate-500'}`}>
-                        {currency === 'USD' ? '$' : 'S/'} {totals.igv}
-                      </span>
-                    </div>
-                    <div className="border-t border-slate-200 pt-2 flex justify-between font-bold text-sm text-slate-900">
-                      <span>TOTAL A PAGAR:</span>
-                      <span className="font-mono text-emerald-600">{currency === 'USD' ? '$' : 'S/'} {totals.total}</span>
-                    </div>
                   </div>
-                </div>
-              </div>
 
-              {/* Botón de Emisión con Control Estricto */}
-              <div className="flex flex-col sm:flex-row items-end sm:items-center justify-between gap-3 pt-2">
-                <div className="text-xs">
-                  {!diagnostics.isValid ? (
-                    <span className="text-rose-700 font-bold flex items-center gap-1.5">
-                      <AlertCircle className="w-4 h-4 text-rose-600" />
-                      Hay {diagnostics.errors.length} observaciones pendientes de cumplir según normativa SUNAT.
-                    </span>
-                  ) : (
-                    <span className="text-emerald-700 font-bold flex items-center gap-1.5">
-                      <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                      Comprobante validado y listo para generar XML UBL 2.1 firmado.
-                    </span>
-                  )}
-                </div>
+                  {/* Botón de Emisión con Control Estricto */}
+                  <div className="flex flex-col sm:flex-row items-end sm:items-center justify-between gap-3 pt-2">
+                    <div className="text-xs">
+                      {!diagnostics.isValid ? (
+                        <span className="text-rose-700 font-bold flex items-center gap-1.5">
+                          <AlertCircle className="w-4 h-4 text-rose-600" />
+                          Hay {diagnostics.errors.length} observaciones pendientes de cumplir según normativa SUNAT.
+                        </span>
+                      ) : (
+                        <span className="text-emerald-700 font-bold flex items-center gap-1.5">
+                          <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                          Comprobante validado y listo para generar XML UBL 2.1 firmado.
+                        </span>
+                      )}
+                    </div>
 
-                <button
-                  type="submit"
-                  disabled={loading || !diagnostics.isValid}
-                  className="flex items-center gap-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold text-sm px-6 py-3.5 rounded-xl shadow-lg shadow-indigo-500/25 transition cursor-pointer"
-                >
-                  {loading ? <RotateCw className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
-                  <span>{loading ? 'Firmando y Transmitiendo...' : 'Firmar y Emitir Comprobante a SUNAT'}</span>
-                </button>
-              </div>
-            </form>
-          );
-        })()}
-      </div>
-    )}
+                    <button
+                      type="submit"
+                      disabled={loading || !diagnostics.isValid}
+                      className="flex items-center gap-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold text-sm px-6 py-3.5 rounded-xl shadow-lg shadow-indigo-500/25 transition cursor-pointer"
+                    >
+                      {loading ? <RotateCw className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+                      <span>{loading ? 'Firmando y Transmitiendo...' : 'Firmar y Emitir Comprobante a SUNAT'}</span>
+                    </button>
+                  </div>
+                </form>
+              );
+            })()}
+          </div>
+        )}
 
         {/* ================================================================== */}
-        {/* TAB 3: COMPROBANTES EMITIDOS */}
+        {/* TAB 3: COMPROBANTES EMITIDOS - EXPERIENCIA FINTECH PRO */}
         {/* ================================================================== */}
         {activeTab === 'documentos' && (
           <div className="space-y-4">
+            {/* ENCABEZADO Y ACCIONES PRINCIPALES */}
             <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
               <div>
-                <h2 className="text-xl font-bold text-slate-900 flex items-center gap-2">
-                  <FileText className="w-6 h-6 text-indigo-600" /> Registro Oficial de Comprobantes ({filteredDocRecords.length})
+                <h2 className="text-xl font-black text-slate-900 tracking-tight flex items-center gap-2.5">
+                  <div className="w-8 h-8 rounded-xl bg-indigo-50 border border-indigo-200/80 flex items-center justify-center text-indigo-600 shadow-2xs">
+                    <FileText className="w-4.5 h-4.5" />
+                  </div>
+                  <span>{docViewMode === 'EXPEDIENTES' ? 'Expedientes Tributarios SUNAT' : 'Cronograma Total de Comprobantes'}</span>
+                  <span className="text-xs font-bold px-2 py-0.5 rounded-full bg-slate-100 text-slate-700 border border-slate-200">
+                    {groupedDocTree.length} operaciones
+                  </span>
                 </h2>
-                <p className="text-xs text-slate-500">Historial completo con CDR oficial, representación impresa y XML firmado</p>
-              </div>
-
-              <button
-                onClick={fetchDocuments}
-                className="flex items-center gap-1.5 bg-white hover:bg-slate-50 text-slate-700 text-xs font-semibold px-3.5 py-2 rounded-xl border border-slate-200 shadow-2xs transition cursor-pointer"
-              >
-                <RefreshCw className="w-3.5 h-3.5 text-indigo-600" /> Actualizar
-              </button>
-            </div>
-
-            {/* BARRA DE FILTROS CCOFACT */}
-            <div className="bg-white border border-slate-200/80 rounded-2xl p-3.5 flex flex-wrap items-center justify-between gap-3 shadow-xs">
-              <div className="relative flex-1 min-w-[220px]">
-                <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
-                <input
-                  type="text"
-                  placeholder="Buscar por número, RUC/DNI o cliente..."
-                  value={docSearchTerm}
-                  onChange={(e) => setDocSearchTerm(e.target.value)}
-                  className="w-full pl-9 pr-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:ring-2 focus:ring-indigo-500/20 outline-none font-medium"
-                />
+                <p className="text-xs text-slate-500 mt-0.5">Historial UBL 2.1 con trazabilidad de notas, saldos contables y validación oficial CDR</p>
               </div>
 
               <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={fetchDocuments}
+                  className="flex items-center gap-1.5 bg-white hover:bg-slate-50 text-slate-700 text-xs font-bold px-3.5 py-2 rounded-xl border border-slate-200/80 shadow-2xs transition cursor-pointer active:scale-95"
+                  title="Actualizar listado de comprobantes desde el servidor"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 text-indigo-600 ${loading ? 'animate-spin' : ''}`} />
+                  <span>Actualizar</span>
+                </button>
+              </div>
+            </div>
+
+            {/* 4 TARJETAS KPI EJECUTIVAS */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
+              {/* KPI 1: Total Expedientes */}
+              <div className="bg-white border border-slate-200/80 rounded-2xl p-4 shadow-2xs hover:shadow-xs transition relative overflow-hidden group">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs font-bold text-slate-500 uppercase tracking-wider">Total Registrados</span>
+                  <div className="w-8 h-8 rounded-xl bg-indigo-50 border border-indigo-100 text-indigo-600 flex items-center justify-center group-hover:scale-110 transition-transform">
+                    <FileText className="w-4 h-4" />
+                  </div>
+                </div>
+                <div className="text-2xl font-black font-mono text-slate-900 tracking-tight">
+                  {docMetrics.totalCount}
+                </div>
+                <div className="mt-2 flex items-center gap-1.5 text-[11px] text-slate-500 font-medium">
+                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-indigo-500" />
+                  <span>{groupedDocTree.length} registros en vista</span>
+                </div>
+              </div>
+
+              {/* KPI 2: Facturación Declarada */}
+              <div className="bg-white border border-slate-200/80 rounded-2xl p-4 shadow-2xs hover:shadow-xs transition relative overflow-hidden group">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs font-bold text-slate-500 uppercase tracking-wider">Ventas Emitidas (PEN)</span>
+                  <div className="w-8 h-8 rounded-xl bg-emerald-50 border border-emerald-100 text-emerald-600 flex items-center justify-center group-hover:scale-110 transition-transform">
+                    <TrendingUp className="w-4 h-4" />
+                  </div>
+                </div>
+                <div className="text-2xl font-black font-mono text-emerald-700 tracking-tight">
+                  S/ {docMetrics.totalPEN.toLocaleString('es-PE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                </div>
+                <div className="mt-2 flex items-center gap-1.5 text-[11px] text-slate-500 font-medium">
+                  {docMetrics.totalUSD > 0 ? (
+                    <span className="font-mono text-emerald-600 font-bold">+ $ {docMetrics.totalUSD.toFixed(2)} USD</span>
+                  ) : (
+                    <span>Base declarada en moneda nacional</span>
+                  )}
+                </div>
+              </div>
+
+              {/* KPI 3: Trazabilidad Notas NC/ND */}
+              <div className="bg-white border border-slate-200/80 rounded-2xl p-4 shadow-2xs hover:shadow-xs transition relative overflow-hidden group">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs font-bold text-slate-500 uppercase tracking-wider">Notas de Ajuste</span>
+                  <div className="w-8 h-8 rounded-xl bg-purple-50 border border-purple-100 text-purple-600 flex items-center justify-center group-hover:scale-110 transition-transform">
+                    <Receipt className="w-4 h-4" />
+                  </div>
+                </div>
+                <div className="text-2xl font-black font-mono text-purple-700 tracking-tight">
+                  {docMetrics.notesCount}
+                </div>
+                <div className="mt-2 flex items-center gap-1.5 text-[11px] text-slate-500 font-medium">
+                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-purple-500" />
+                  <span>Crédito y Débito sincronizadas</span>
+                </div>
+              </div>
+
+              {/* KPI 4: Conformidad SUNAT */}
+              <div className="bg-white border border-slate-200/80 rounded-2xl p-4 shadow-2xs hover:shadow-xs transition relative overflow-hidden group">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs font-bold text-slate-500 uppercase tracking-wider">Conformidad SUNAT</span>
+                  <div className="w-8 h-8 rounded-xl bg-blue-50 border border-blue-100 text-blue-600 flex items-center justify-center group-hover:scale-110 transition-transform">
+                    <ShieldCheck className="w-4 h-4" />
+                  </div>
+                </div>
+                <div className="text-2xl font-black font-mono text-blue-700 tracking-tight">
+                  {docMetrics.complianceRate}%
+                </div>
+                <div className="mt-2 flex items-center gap-1.5 text-[11px] text-slate-500 font-medium">
+                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-blue-500" />
+                  <span>{docMetrics.acceptedCount} comprobantes con CDR 0</span>
+                </div>
+              </div>
+            </div>
+
+            {/* SELECTOR DE VISTA PRO: EXPEDIENTES TRIBUTARIOS vs CRONOGRAMA CONTINUO */}
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-white border border-slate-200/80 rounded-2xl p-2.5 shadow-2xs">
+              <div className="inline-flex p-1 bg-slate-100/90 rounded-xl border border-slate-200">
+                <button
+                  type="button"
+                  onClick={() => setDocViewMode('EXPEDIENTES')}
+                  className={`inline-flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-bold transition cursor-pointer ${
+                    docViewMode === 'EXPEDIENTES'
+                      ? 'bg-white text-indigo-700 shadow-2xs border border-indigo-100'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  <FileText className="w-4 h-4 text-indigo-600" />
+                  <span>Expedientes Tributarios (Con Trazabilidad)</span>
+                  <span className="text-[9px] px-1.5 py-0.2 rounded-full bg-indigo-50 text-indigo-700 font-extrabold uppercase border border-indigo-200">
+                    Principal
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDocViewMode('TODOS')}
+                  className={`inline-flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-bold transition cursor-pointer ${
+                    docViewMode === 'TODOS'
+                      ? 'bg-white text-indigo-700 shadow-2xs border border-indigo-100'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  <Clock className="w-4 h-4 text-slate-500" />
+                  <span>Cronograma Total (Todos los Comprobantes)</span>
+                </button>
+              </div>
+
+              <div className="text-xs text-slate-500 font-medium px-2">
+                {docViewMode === 'EXPEDIENTES' ? (
+                  <span className="flex items-center gap-1.5 text-indigo-900 font-semibold">
+                    <Sparkles className="w-3.5 h-3.5 text-indigo-600" />
+                    Expedientes comerciales agrupados con su trazabilidad de notas vinculadas
+                  </span>
+                ) : (
+                  <span className="flex items-center gap-1.5 text-slate-700 font-semibold">
+                    <Clock className="w-3.5 h-3.5 text-slate-500" />
+                    Registro cronológico completo de emisión (más reciente a más antiguo)
+                  </span>
+                )}
+              </div>
+            </div>
+
+            {/* BARRA DE FILTROS CCOFACT PRO */}
+            <div className="bg-white border border-slate-200/80 rounded-2xl p-3.5 flex flex-wrap items-center justify-between gap-3 shadow-xs">
+              <div className="relative flex-1 min-w-[240px]">
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                <input
+                  type="text"
+                  placeholder="Buscar por número (ej: B001-27), RUC/DNI o cliente..."
+                  value={docSearchTerm}
+                  onChange={(e) => setDocSearchTerm(e.target.value)}
+                  className="w-full pl-9 pr-8 py-2 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-400 outline-none font-medium transition"
+                />
+                {docSearchTerm && (
+                  <button
+                    type="button"
+                    onClick={() => setDocSearchTerm('')}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-0.5 rounded cursor-pointer"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+
+              <div className="flex items-center gap-2 flex-wrap">
+                <div className="flex items-center gap-1.5 bg-slate-50 border border-slate-200 rounded-xl px-2.5 py-1.5 text-xs">
+                  <span className="text-[10px] font-bold text-slate-400 uppercase">Desde:</span>
+                  <input
+                    type="date"
+                    value={docFilterStartDate}
+                    onChange={(e) => setDocFilterStartDate(e.target.value)}
+                    className="bg-transparent font-medium text-slate-700 outline-none text-xs"
+                  />
+                </div>
+                <div className="flex items-center gap-1.5 bg-slate-50 border border-slate-200 rounded-xl px-2.5 py-1.5 text-xs">
+                  <span className="text-[10px] font-bold text-slate-400 uppercase">Hasta:</span>
+                  <input
+                    type="date"
+                    value={docFilterEndDate}
+                    onChange={(e) => setDocFilterEndDate(e.target.value)}
+                    className="bg-transparent font-medium text-slate-700 outline-none text-xs"
+                  />
+                </div>
+
                 <select
                   value={docFilterType}
                   onChange={(e) => setDocFilterType(e.target.value)}
-                  className="text-xs bg-slate-50 border border-slate-200 rounded-xl px-2.5 py-1.5 font-bold text-slate-700 outline-none cursor-pointer"
+                  className="text-xs bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 font-bold text-slate-700 outline-none cursor-pointer hover:bg-slate-100 transition"
                 >
                   <option value="ALL">Todos los Tipos</option>
                   <option value="01">Factura (01)</option>
@@ -3948,181 +4508,500 @@ export function App() {
                 <select
                   value={docFilterStatus}
                   onChange={(e) => setDocFilterStatus(e.target.value)}
-                  className="text-xs bg-slate-50 border border-slate-200 rounded-xl px-2.5 py-1.5 font-bold text-slate-700 outline-none cursor-pointer"
+                  className="text-xs bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 font-bold text-slate-700 outline-none cursor-pointer hover:bg-slate-100 transition"
                 >
                   <option value="ALL">Todos los Estados</option>
                   <option value="ACCEPTED">Aceptados (CDR 0)</option>
                   <option value="ANULADO">Anulados (N/C)</option>
                   <option value="REJECTED">Observados / En Cola</option>
                 </select>
+
+                {(docSearchTerm || docFilterStartDate || docFilterEndDate || docFilterType !== 'ALL' || docFilterStatus !== 'ALL') && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDocSearchTerm('');
+                      setDocFilterStartDate('');
+                      setDocFilterEndDate('');
+                      setDocFilterType('ALL');
+                      setDocFilterStatus('ALL');
+                    }}
+                    className="text-xs font-bold text-rose-600 hover:text-rose-800 bg-rose-50 hover:bg-rose-100 border border-rose-200 px-2.5 py-1.5 rounded-xl transition cursor-pointer"
+                  >
+                    Limpiar
+                  </button>
+                )}
               </div>
             </div>
 
+            {/* TABLA PRINCIPAL DE COMPROBANTES CON DISEÑO PRO */}
             <div className="bg-white border border-slate-200/80 rounded-3xl overflow-hidden shadow-xs">
               <div className="overflow-x-auto">
                 <table className="w-full text-left text-xs">
                   <thead>
-                    <tr className="border-b border-slate-200 text-slate-500 bg-slate-50/80 font-bold">
-                      <th className="py-3 px-4">Comprobante</th>
-                      <th className="py-3 px-4">Tipo</th>
-                      <th className="py-3 px-4">Cliente / Receptor</th>
-                      <th className="py-3 px-4">Fecha / Hora</th>
-                      <th className="py-3 px-4 text-right">Total</th>
-                      <th className="py-3 px-4 text-center">Estado Comercial</th>
-                      <th className="py-3 px-4 text-center">Estado SUNAT</th>
-                      <th className="py-3 px-4 text-right">Acciones</th>
+                    <tr className="border-b border-slate-200/80 text-slate-500 bg-slate-50/90 font-bold uppercase tracking-wider text-[11px]">
+                      <th className="py-3.5 px-4">Comprobante</th>
+                      <th className="py-3.5 px-4">Cliente / Receptor</th>
+                      <th className="py-3.5 px-4">Fecha / Hora</th>
+                      <th className="py-3.5 px-4 text-right">Total / Saldo</th>
+                      <th className="py-3.5 px-4 text-center">Estado Comercial</th>
+                      <th className="py-3.5 px-4 text-center">Estado SUNAT</th>
+                      <th className="py-3.5 px-4 text-right">Acciones</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
-                    {paginatedDocRecords.map((doc: DocumentRecord) => (
-                      <tr key={doc.id} className="hover:bg-slate-50/80 transition">
-                        <td className="py-3 px-4 font-mono font-bold text-indigo-600">
-                          {doc.full_number}
-                        </td>
-                        <td className="py-3 px-4 font-semibold text-slate-800">
-                          {doc.document_type === '01' ? 'Factura' : doc.document_type === '03' ? 'Boleta' : doc.document_type === '07' ? 'Nota Crédito' : doc.document_type === '08' ? 'Nota Débito' : 'Guía Remisión'}
-                        </td>
-                        <td className="py-3 px-4">
-                          <div className="font-semibold text-slate-900">{doc.client_name}</div>
-                          <div className="text-[10px] text-slate-400 font-mono">{doc.client_doc_number}</div>
-                        </td>
-                        <td className="py-3 px-4 text-slate-500 font-mono text-[11px]">
-                          {doc.issue_date} {doc.issue_time}
-                        </td>
-                        <td className="py-3 px-4 text-right font-mono font-bold text-slate-900">
-                          {doc.currency === 'USD' ? '$' : 'S/'} {Number(doc.total_amount).toFixed(2)}
-                        </td>
-                        {/* ESTADO COMERCIAL */}
-                        <td className="py-3 px-4 text-center">
-                          {doc.status === 'ANULADO' ? (
-                            <span className="text-[10px] font-black px-2 py-0.5 rounded-full bg-rose-50 text-rose-700 border border-rose-200 uppercase">
-                              Anulado
-                            </span>
-                          ) : (
-                            <span className="text-[10px] font-black px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 uppercase">
-                              Vigente
-                            </span>
+                    {paginatedDocTree.map(({ doc, notes }) => {
+                      const officialSunat = getOfficialSunatStatus(doc);
+                      const commStatus = getCommercialMovementStatus(doc, notes);
+                      const isExpanded = !!expandedDocIds[doc.id];
+
+                      // Clases e ícono según tipo de comprobante
+                      let docTypeBadgeClass = 'bg-teal-50 text-teal-800 border-teal-200';
+                      let docTypeLabel = 'Guía Remisión';
+                      let DocIcon = Truck;
+
+                      if (doc.document_type === '01') {
+                        docTypeBadgeClass = 'bg-blue-50 text-blue-800 border-blue-200';
+                        docTypeLabel = 'Factura';
+                        DocIcon = Building2;
+                      } else if (doc.document_type === '03') {
+                        docTypeBadgeClass = 'bg-emerald-50 text-emerald-800 border-emerald-200';
+                        docTypeLabel = 'Boleta';
+                        DocIcon = FileText;
+                      } else if (doc.document_type === '07') {
+                        docTypeBadgeClass = 'bg-rose-50 text-rose-800 border-rose-200';
+                        docTypeLabel = 'Nota Crédito';
+                        DocIcon = Receipt;
+                      } else if (doc.document_type === '08') {
+                        docTypeBadgeClass = 'bg-purple-50 text-purple-800 border-purple-200';
+                        docTypeLabel = 'Nota Débito';
+                        DocIcon = Receipt;
+                      }
+
+                      const clientInitial = (doc.client_name || 'C').charAt(0).toUpperCase();
+
+                      return (
+                        <React.Fragment key={doc.id}>
+                          <tr className={`hover:bg-slate-50/80 transition ${isExpanded ? 'bg-indigo-50/25' : ''}`}>
+                            {/* COLUMNA 1: COMPROBANTE Y TIPO */}
+                            <td className="py-3.5 px-4">
+                              <div className="flex items-center gap-2.5">
+                                <div className={`w-8 h-8 rounded-xl flex items-center justify-center border shadow-2xs shrink-0 ${docTypeBadgeClass}`}>
+                                  <DocIcon className="w-4 h-4" />
+                                </div>
+                                <div className="space-y-0.5">
+                                  <div className="flex items-center gap-1.5 flex-wrap">
+                                    <span className="font-mono font-black text-slate-900 text-sm tracking-tight">
+                                      {doc.full_number}
+                                    </span>
+                                    <span className={`text-[9px] font-extrabold uppercase px-1.5 py-0.2 rounded border ${docTypeBadgeClass}`}>
+                                      {docTypeLabel}
+                                    </span>
+                                  </div>
+
+                                  {notes.length > 0 && (
+                                    <div>
+                                      <button
+                                        type="button"
+                                        onClick={() => setExpandedDocIds(prev => ({ ...prev, [doc.id]: !prev[doc.id] }))}
+                                        className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold transition shadow-2xs cursor-pointer border ${
+                                          isExpanded
+                                            ? 'bg-indigo-600 text-white border-indigo-700'
+                                            : 'bg-indigo-50 text-indigo-700 border-indigo-200 hover:bg-indigo-100'
+                                        }`}
+                                        title="Ver panel ejecutivo de modificaciones, trazabilidad contable e ítems afectados"
+                                      >
+                                        <Receipt className="w-3 h-3" />
+                                        <span>{notes.length} Ajuste(s)</span>
+                                        <ChevronDown className={`w-3 h-3 transition-transform ${isExpanded ? 'rotate-180' : ''}`} />
+                                      </button>
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                            </td>
+
+                            {/* COLUMNA 2: CLIENTE / RECEPTOR */}
+                            <td className="py-3.5 px-4">
+                              <div className="flex items-start gap-2.5 max-w-[260px]">
+                                <div className="w-7 h-7 rounded-lg bg-slate-100 border border-slate-200/80 font-bold text-slate-600 flex items-center justify-center text-xs shrink-0 mt-0.5">
+                                  {clientInitial}
+                                </div>
+                                <div className="min-w-0">
+                                  <div className="font-bold text-slate-900 truncate" title={doc.client_name}>
+                                    {doc.client_name || 'CONSUMIDOR FINAL'}
+                                  </div>
+                                  <div className="text-[10px] text-slate-500 font-mono flex items-center gap-1.5 flex-wrap mt-0.5">
+                                    <span className="bg-slate-100 px-1.5 py-0.2 rounded border border-slate-200 text-slate-600 font-bold">
+                                      {doc.client_doc_type === '6' ? 'RUC' : doc.client_doc_type === '1' ? 'DNI' : 'DOC'}
+                                    </span>
+                                    <span>{doc.client_doc_number || '-'}</span>
+                                    {(doc.document_type === '07' || doc.document_type === '08') && doc.ref_series && doc.ref_number && (
+                                      <span className="font-bold text-indigo-700 bg-indigo-50 px-1.5 py-0.2 rounded border border-indigo-200">
+                                        Modifica: {doc.ref_series}-{doc.ref_number}
+                                      </span>
+                                    )}
+                                  </div>
+                                </div>
+                              </div>
+                            </td>
+
+                            {/* COLUMNA 3: FECHA / HORA */}
+                            <td className="py-3.5 px-4 font-mono text-slate-600 text-[11px]">
+                              <div className="font-bold text-slate-800">{doc.issue_date}</div>
+                              <div className="text-[10px] text-slate-400">{doc.issue_time || '00:00:00'}</div>
+                            </td>
+
+                            {/* COLUMNA 4: TOTAL Y SALDO CONTABLE */}
+                            <td className="py-3.5 px-4 text-right font-mono">
+                              <div className="font-black text-slate-900 text-sm">
+                                {doc.currency === 'USD' ? '$' : 'S/'} {Number(doc.total_amount).toFixed(2)}
+                              </div>
+                              {commStatus.hasAdjustments ? (
+                                <div className={`inline-block text-[10px] font-black px-1.5 py-0.5 rounded border mt-0.5 ${
+                                  commStatus.saldo <= 0.009
+                                    ? 'bg-rose-50 text-rose-700 border-rose-200'
+                                    : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                }`}>
+                                  {commStatus.saldo <= 0.009
+                                    ? 'Saldo: S/ 0.00 (Liquidado)'
+                                    : `Saldo: ${doc.currency === 'USD' ? '$' : 'S/'} ${commStatus.saldo.toFixed(2)}`}
+                                </div>
+                              ) : (
+                                <div className="text-[10px] text-slate-400 font-medium">
+                                  Saldo: 100%
+                                </div>
+                              )}
+                            </td>
+
+                            {/* COLUMNA 5: ESTADO COMERCIAL / OPERATIVO */}
+                            <td className="py-3.5 px-4 text-center">
+                              <div className="flex flex-col items-center gap-0.5">
+                                <span className={`text-[10px] font-black px-2.5 py-0.5 rounded-full uppercase border shadow-2xs ${commStatus.badgeClass}`}>
+                                  {commStatus.badge}
+                                </span>
+                                <span className="text-[10px] text-slate-500 font-semibold truncate max-w-[130px]" title={commStatus.sublabel}>
+                                  {commStatus.sublabel}
+                                </span>
+                              </div>
+                            </td>
+
+                            {/* COLUMNA 6: ESTADO SUNAT ESTRICTO (RESPUESTA OFICIAL SUNAT) */}
+                            <td className="py-3.5 px-4 text-center">
+                              <button
+                                type="button"
+                                onClick={() => setDiagnosticDoc(doc)}
+                                title={`Diagnóstico Oficial SUNAT: ${officialSunat.desc} (Haz clic para detalles)`}
+                                className={`text-[10px] font-extrabold px-2.5 py-0.5 rounded-full cursor-pointer hover:opacity-85 transition inline-flex items-center gap-1 border shadow-2xs ${officialSunat.bgClass}`}
+                              >
+                                <span>{officialSunat.label}</span>
+                                <Info className="w-2.5 h-2.5 opacity-70" />
+                              </button>
+                            </td>
+
+                            {/* COLUMNA 7: ACCIONES */}
+                            <td className="py-3.5 px-4 text-right">
+                              <div className="flex items-center justify-end gap-1.5">
+                                {/* Clúster 1: Representación Impresa y Descargas */}
+                                <div className="bg-slate-100/90 p-0.5 rounded-xl border border-slate-200/80 flex items-center shadow-2xs">
+                                  <button
+                                    onClick={() => openPreview(doc)}
+                                    className="p-1.5 text-slate-600 hover:text-slate-900 hover:bg-white rounded-lg transition-all cursor-pointer"
+                                    title="Ver / Imprimir Representación Oficial A4"
+                                  >
+                                    <Printer className="w-3.5 h-3.5" />
+                                  </button>
+
+                                  <button
+                                    onClick={() => window.open(`${API_BASE}/documents/${doc.id}/html?format=TICKET`, '_blank')}
+                                    className="p-1.5 text-indigo-600 hover:text-indigo-800 hover:bg-white rounded-lg transition-all cursor-pointer"
+                                    title="Imprimir Ticket Térmico POS 80mm"
+                                  >
+                                    <Receipt className="w-3.5 h-3.5" />
+                                  </button>
+
+                                  <a
+                                    href={`${API_BASE}/documents/${doc.id}/xml`}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="p-1.5 text-amber-600 hover:text-amber-800 hover:bg-white rounded-lg transition-all"
+                                    title="Descargar XML UBL 2.1 Firmado"
+                                  >
+                                    <Download className="w-3.5 h-3.5" />
+                                  </a>
+
+                                  <a
+                                    href={`${API_BASE}/documents/${doc.id}/cdr`}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="p-1.5 text-emerald-600 hover:text-emerald-800 hover:bg-white rounded-lg transition-all"
+                                    title="Descargar CDR Oficial SUNAT"
+                                  >
+                                    <Download className="w-3.5 h-3.5" />
+                                  </a>
+                                </div>
+
+                                {/* Clúster 2: Acciones Tributarias y Operativas */}
+                                {doc.status !== 'ACCEPTED' && doc.status !== 'ANULADO' && (
+                                  <button
+                                    onClick={() => handleConsultarCdr(doc.id)}
+                                    className="p-1.5 bg-blue-50 hover:bg-blue-600 text-blue-700 hover:text-white rounded-xl border border-blue-200/70 shadow-2xs hover:scale-105 active:scale-95 transition-all cursor-pointer"
+                                    title="Consultar CDR Oficial en SUNAT (getStatusCdr)"
+                                  >
+                                    <Search className="w-3.5 h-3.5" />
+                                  </button>
+                                )}
+
+                                {doc.status !== 'ACCEPTED' && doc.status !== 'ANULADO' && (
+                                  <button
+                                    onClick={() => handleRetry(doc.id)}
+                                    className="p-1.5 bg-amber-50 hover:bg-amber-600 text-amber-700 hover:text-white rounded-xl border border-amber-200/70 shadow-2xs hover:scale-105 active:scale-95 transition-all cursor-pointer"
+                                    title="Reintentar Envío a SUNAT"
+                                  >
+                                    <RotateCw className="w-3.5 h-3.5" />
+                                  </button>
+                                )}
+
+                                {(doc.status || '').includes('ACCEPTED') && doc.status !== 'ANULADO' && commStatus.type !== 'ANULADO_TOTAL' && (doc.document_type === '01' || doc.document_type === '03') && (
+                                  <>
+                                    <button
+                                      onClick={() => handleOpenSmartEdit(doc)}
+                                      className="p-1.5 bg-indigo-50/90 hover:bg-indigo-600 text-indigo-700 hover:text-white rounded-xl border border-indigo-200/70 shadow-2xs hover:scale-105 active:scale-95 transition-all cursor-pointer"
+                                      title="Edición Inteligente con Diff Engine (SUNAT UBL 2.1)"
+                                    >
+                                      <Wand2 className="w-3.5 h-3.5" />
+                                    </button>
+                                    <button
+                                      onClick={() => handleOpenManualNote(doc, notes)}
+                                      className="p-1.5 bg-purple-50/90 hover:bg-purple-600 text-purple-700 hover:text-white rounded-xl border border-purple-200/70 shadow-2xs hover:scale-105 active:scale-95 transition-all cursor-pointer"
+                                      title="Emisión Manual de Nota de Crédito o Débito"
+                                    >
+                                      <FileSpreadsheet className="w-3.5 h-3.5" />
+                                    </button>
+                                  </>
+                                )}
+
+                                {(doc.status || '').includes('ACCEPTED') && doc.status !== 'ANULADO' && commStatus.saldo > 0.009 && (
+                                  <button
+                                    onClick={() => handleAnularDocument(doc, notes)}
+                                    className="p-1.5 bg-rose-50/90 hover:bg-rose-600 text-rose-700 hover:text-white rounded-xl border border-rose-200/70 shadow-2xs hover:scale-105 active:scale-95 transition-all cursor-pointer"
+                                    title={`Anulación Formal ante SUNAT (Emite Nota de Crédito por el saldo remanente de ${doc.currency === 'USD' ? '$' : 'S/'} ${commStatus.saldo.toFixed(2)})`}
+                                  >
+                                    <Ban className="w-3.5 h-3.5" />
+                                  </button>
+                                )}
+
+                                {(doc.status === 'ANULADO' || commStatus.saldo <= 0.009) && (
+                                  <span className="inline-flex items-center gap-1 text-[10px] text-rose-600 font-black px-2 py-0.5 bg-rose-50/90 rounded-full border border-rose-200 shadow-2xs">
+                                    <span className="w-1.5 h-1.5 rounded-full bg-rose-500" />
+                                    Liquidado
+                                  </span>
+                                )}
+
+                                <button
+                                  onClick={() => handleDeleteDocument(doc)}
+                                  className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-xl transition-all cursor-pointer"
+                                  title="Eliminar registro de la Base de Datos"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+
+                          {/* PANEL EJECUTIVO DE RESUMEN DE MODIFICACIONES Y TRAZABILIDAD */}
+                          {isExpanded && notes.length > 0 && (
+                            <tr className="bg-slate-50/90 border-y-2 border-indigo-200">
+                              <td colSpan={7} className="p-4 sm:p-5">
+                                <div className="bg-white rounded-2xl border border-indigo-100 shadow-xs p-4.5 space-y-4">
+                                  {/* HEADER DE TRAZABILIDAD */}
+                                  <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-100">
+                                    <div className="flex items-center gap-2.5">
+                                      <div className="w-9 h-9 rounded-xl bg-indigo-50 border border-indigo-200 flex items-center justify-center text-indigo-600 font-bold shadow-2xs">
+                                        <Receipt className="w-4.5 h-4.5" />
+                                      </div>
+                                      <div>
+                                        <h4 className="font-extrabold text-slate-800 text-xs sm:text-sm flex items-center gap-2">
+                                          <span>Trazabilidad y Resumen de Ajustes Vinculados</span>
+                                          <span className="text-[11px] font-bold px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-800">
+                                            {notes.length} comprobante(s) de ajuste
+                                          </span>
+                                        </h4>
+                                        <p className="text-[11px] text-slate-500">
+                                          Comprobante Origen: <span className="font-mono font-bold text-slate-800">{doc.full_number}</span> — Emitido el {doc.issue_date} {doc.issue_time}
+                                        </p>
+                                      </div>
+                                    </div>
+
+                                    {/* MÉTRICAS FINANCIERAS RESUMIDAS */}
+                                    <div className="flex items-center gap-2 sm:gap-4 flex-wrap bg-slate-50 border border-slate-200/80 rounded-xl px-3.5 py-2 text-xs">
+                                      <div>
+                                        <span className="text-[10px] text-slate-400 block uppercase font-bold">Total Inicial</span>
+                                        <span className="font-mono font-bold text-slate-700">
+                                          {doc.currency === 'USD' ? '$' : 'S/'} {Number(doc.total_amount).toFixed(2)}
+                                        </span>
+                                      </div>
+                                      <div className="text-slate-300 font-light text-base">→</div>
+                                      <div>
+                                        <span className="text-[10px] text-rose-500 block uppercase font-bold">Ajustes Notas</span>
+                                        <span className="font-mono font-bold text-rose-600">
+                                          {commStatus.totalCredit > 0 && `-${doc.currency === 'USD' ? '$' : 'S/'} ${commStatus.totalCredit.toFixed(2)} `}
+                                          {commStatus.totalDebit > 0 && `+${doc.currency === 'USD' ? '$' : 'S/'} ${commStatus.totalDebit.toFixed(2)}`}
+                                        </span>
+                                      </div>
+                                      <div className="text-slate-300 font-light text-base">=</div>
+                                      <div>
+                                        <span className="text-[10px] text-emerald-600 block uppercase font-bold">Saldo Comercial Resultante</span>
+                                        <span className={`font-mono font-extrabold text-sm ${commStatus.saldo <= 0.009 ? 'text-rose-600' : 'text-emerald-700'}`}>
+                                          {doc.currency === 'USD' ? '$' : 'S/'} {commStatus.saldo.toFixed(2)}
+                                          {commStatus.saldo <= 0.009 ? (
+                                            <span className="text-[10px] font-bold ml-1.5 text-rose-700 bg-rose-50 border border-rose-200 px-1.5 py-0.5 rounded">
+                                              Liquidado / Anulado
+                                            </span>
+                                          ) : (
+                                            <span className="text-[10px] font-bold ml-1.5 text-emerald-700 bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 rounded">
+                                              Saldo Remanente
+                                            </span>
+                                          )}
+                                        </span>
+                                      </div>
+                                    </div>
+                                  </div>
+
+                                  {/* LISTADO DE NOTAS CON ÍTEMS RESUMIDOS */}
+                                  <div className="space-y-3">
+                                    {notes.map((note, nIdx) => {
+                                      const isNC = note.document_type === '07';
+                                      const officialNoteSunat = getOfficialSunatStatus(note);
+                                      const noteItems = Array.isArray(note.items) ? note.items : [];
+
+                                      return (
+                                        <div key={note.id || nIdx} className="bg-slate-50/70 border border-slate-200 rounded-xl p-3.5 space-y-2.5">
+                                          <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                                            <div className="flex items-center gap-2 flex-wrap">
+                                              <span className={`text-[10px] font-black px-2 py-0.5 rounded uppercase tracking-wide border ${
+                                                isNC ? 'bg-rose-100 text-rose-800 border-rose-200' : 'bg-blue-100 text-blue-800 border border-blue-200'
+                                              }`}>
+                                                {isNC ? 'Nota de Crédito' : 'Nota de Débito'}
+                                              </span>
+                                              <span className="font-mono font-black text-indigo-700 text-sm">{note.full_number}</span>
+                                              <span className="text-slate-400 font-mono text-[11px]">{note.issue_date} {note.issue_time}</span>
+
+                                              {/* MOTIVO SUNAT CATÁLOGO 09 / 10 */}
+                                              <div className="inline-flex items-center gap-1 bg-white border border-slate-200 px-2 py-0.5 rounded-md text-[11px] font-semibold text-slate-700">
+                                                <span className="text-indigo-600 font-mono font-bold">[{note.ref_reason_code || '01'}]</span>
+                                                <span>{note.ref_reason_desc || note.sunat_description || (isNC ? 'Anulación de la operación' : 'Aumento de valor')}</span>
+                                              </div>
+                                            </div>
+
+                                            <div className="flex items-center gap-3">
+                                              <div className="text-right">
+                                                <span className="text-[10px] text-slate-400 block font-bold">Importe de Nota</span>
+                                                <span className={`font-mono font-black text-sm ${isNC ? 'text-rose-600' : 'text-blue-600'}`}>
+                                                  {isNC ? '-' : '+'} {note.currency === 'USD' ? '$' : 'S/'} {Number(note.total_amount).toFixed(2)}
+                                                </span>
+                                              </div>
+
+                                              {/* ESTADO SUNAT DE LA NOTA */}
+                                              <button
+                                                type="button"
+                                                onClick={() => setDiagnosticDoc(note)}
+                                                title="Ver respuesta oficial SUNAT de esta nota"
+                                                className={`text-[9px] font-bold px-2 py-0.5 rounded-full border cursor-pointer ${officialNoteSunat.bgClass}`}
+                                              >
+                                                SUNAT: {officialNoteSunat.label}
+                                              </button>
+
+                                              {/* ACCIONES DE LA NOTA */}
+                                              <div className="flex items-center gap-1">
+                                                <button
+                                                  onClick={() => window.open(`${API_BASE}/documents/${note.id}/html?format=TICKET`, '_blank')}
+                                                  className="p-1 bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 rounded transition cursor-pointer"
+                                                  title="Ticket 80mm de Nota"
+                                                >
+                                                  <Receipt className="w-3 h-3 text-indigo-600" />
+                                                </button>
+                                                <button
+                                                  onClick={() => openPreview(note)}
+                                                  className="p-1 bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 rounded transition cursor-pointer"
+                                                  title="Ver A4 de Nota"
+                                                >
+                                                  <Printer className="w-3 h-3 text-slate-600" />
+                                                </button>
+                                                <a
+                                                  href={`${API_BASE}/documents/${note.id}/xml`}
+                                                  target="_blank"
+                                                  rel="noreferrer"
+                                                  className="p-1 bg-white hover:bg-amber-50 text-amber-700 border border-slate-200 rounded transition"
+                                                  title="Descargar XML firmado UBL 2.1"
+                                                >
+                                                  <Download className="w-3 h-3" />
+                                                </a>
+                                                <a
+                                                  href={`${API_BASE}/documents/${note.id}/cdr`}
+                                                  target="_blank"
+                                                  rel="noreferrer"
+                                                  className="p-1 bg-white hover:bg-emerald-50 text-emerald-700 border border-slate-200 rounded transition"
+                                                  title="Descargar CDR Oficial SUNAT"
+                                                >
+                                                  <Download className="w-3 h-3" />
+                                                </a>
+                                              </div>
+                                            </div>
+                                          </div>
+
+                                          {/* TABLA DE ÍTEMS / BIENES AFECTADOS */}
+                                          {noteItems.length > 0 ? (
+                                            <div className="bg-white rounded-lg border border-slate-200 overflow-hidden text-[11px]">
+                                              <table className="w-full text-left">
+                                                <thead>
+                                                  <tr className="bg-slate-100/70 text-slate-500 font-bold border-b border-slate-200 text-[10px]">
+                                                    <th className="py-1 px-3">Código</th>
+                                                    <th className="py-1 px-3">Bien / Concepto Modificado</th>
+                                                    <th className="py-1 px-3 text-center">Cant. Afectada</th>
+                                                    <th className="py-1 px-3 text-right">Precio Unit.</th>
+                                                    <th className="py-1 px-3 text-right">Subtotal Ajuste</th>
+                                                  </tr>
+                                                </thead>
+                                                <tbody className="divide-y divide-slate-100 font-mono">
+                                                  {noteItems.map((it, idx) => (
+                                                    <tr key={it.id || idx} className="hover:bg-slate-50/50">
+                                                      <td className="py-1 px-3 text-slate-400 text-[10px]">{it.code || `ITEM-${idx + 1}`}</td>
+                                                      <td className="py-1 px-3 font-sans font-semibold text-slate-800">{it.description}</td>
+                                                      <td className="py-1 px-3 text-center font-bold text-slate-700">{it.quantity}</td>
+                                                      <td className="py-1 px-3 text-right text-slate-600">
+                                                        {doc.currency === 'USD' ? '$' : 'S/'} {Number(it.unit_price).toFixed(2)}
+                                                      </td>
+                                                      <td className={`py-1 px-3 text-right font-black ${isNC ? 'text-rose-600' : 'text-blue-600'}`}>
+                                                        {isNC ? '-' : '+'} {doc.currency === 'USD' ? '$' : 'S/'} {Number((it.quantity * it.unit_price) || it.subtotal || 0).toFixed(2)}
+                                                      </td>
+                                                    </tr>
+                                                  ))}
+                                                </tbody>
+                                              </table>
+                                            </div>
+                                          ) : (
+                                            <div className="bg-white rounded-lg border border-slate-200 px-3 py-1.5 text-[11px] text-slate-500 flex items-center justify-between">
+                                              <span>Ajuste contable aplicado al comprobante: <strong className="text-slate-700">{note.ref_reason_desc || note.sunat_description || 'Ajuste comercial'}</strong></span>
+                                              <span className="font-mono font-bold text-slate-800">
+                                                Monto total: {doc.currency === 'USD' ? '$' : 'S/'} {Number(note.total_amount).toFixed(2)}
+                                              </span>
+                                            </div>
+                                          )}
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                </div>
+                              </td>
+                            </tr>
                           )}
-                        </td>
-                        {/* ESTADO SUNAT */}
-                        <td className="py-3 px-4 text-center">
-                          <button
-                            type="button"
-                            onClick={() => setDiagnosticDoc(doc)}
-                            title="Haz clic para ver el Diagnóstico Tributario Oficial retornado por SUNAT"
-                            className={`text-[10px] font-bold px-2.5 py-0.5 rounded-full cursor-pointer hover:opacity-85 transition inline-flex items-center gap-1 ${
-                              doc.status === 'ANULADO'
-                                ? 'bg-rose-100 text-rose-800 border border-rose-300 font-extrabold'
-                                : doc.status.includes('ACCEPTED')
-                                ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
-                                : doc.status === 'QUEUED'
-                                ? 'bg-amber-50 text-amber-700 border border-amber-200'
-                                : 'bg-rose-50 text-rose-700 border border-rose-200'
-                            }`}
-                          >
-                            <span>{doc.status === 'ANULADO' ? 'Anulado (NC)' : doc.status}</span>
-                            <Info className="w-2.5 h-2.5 opacity-60" />
-                          </button>
-                        </td>
-                        <td className="py-3 px-4 text-right">
-                          <div className="flex items-center justify-end gap-1.5">
-                            <button
-                              onClick={() => openPreview(doc)}
-                              className="p-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition cursor-pointer"
-                              title="Ver / Imprimir Representación Oficial"
-                            >
-                              <Printer className="w-3.5 h-3.5" />
-                            </button>
-
-                            <a
-                              href={`${API_BASE}/documents/${doc.id}/xml`}
-                              target="_blank"
-                              rel="noreferrer"
-                              className="p-1.5 bg-amber-50 hover:bg-amber-100 text-amber-700 rounded-lg transition"
-                              title="Descargar XML UBL 2.1 Firmado"
-                            >
-                              <Download className="w-3.5 h-3.5" />
-                            </a>
-
-                            <a
-                              href={`${API_BASE}/documents/${doc.id}/cdr`}
-                              target="_blank"
-                              rel="noreferrer"
-                              className="p-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 rounded-lg transition"
-                              title="Descargar CDR Oficial SUNAT"
-                            >
-                              <Download className="w-3.5 h-3.5" />
-                            </a>
-
-                            {doc.status !== 'ACCEPTED' && doc.status !== 'ANULADO' && (
-                              <button
-                                onClick={() => handleConsultarCdr(doc.id)}
-                                className="p-1.5 bg-blue-50 hover:bg-blue-100 text-blue-700 rounded-lg transition cursor-pointer"
-                                title="Consultar CDR Oficial en SUNAT (getStatusCdr)"
-                              >
-                                <Search className="w-3.5 h-3.5" />
-                              </button>
-                            )}
-
-                            {doc.status !== 'ACCEPTED' && doc.status !== 'ANULADO' && (
-                              <button
-                                onClick={() => handleRetry(doc.id)}
-                                className="p-1.5 bg-amber-50 hover:bg-amber-100 text-amber-700 rounded-lg transition cursor-pointer"
-                                title="Reintentar Envío a SUNAT"
-                              >
-                                <RotateCw className="w-3.5 h-3.5" />
-                              </button>
-                            )}
-
-                            {doc.status.includes('ACCEPTED') && doc.status !== 'ANULADO' && (doc.document_type === '01' || doc.document_type === '03') && (
-                              <>
-                                <button
-                                  onClick={() => handleOpenSmartEdit(doc)}
-                                  className="p-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-lg transition cursor-pointer"
-                                  title="Edición Inteligente con Diff Engine (SUNAT UBL 2.1) - Detección automática de Casos A, B, C y D"
-                                >
-                                  <Wand2 className="w-3.5 h-3.5" />
-                                </button>
-                                <button
-                                  onClick={() => handleOpenManualNote(doc)}
-                                  className="p-1.5 bg-purple-50 hover:bg-purple-100 text-purple-700 rounded-lg transition cursor-pointer"
-                                  title="Emisión Manual de Nota de Crédito o Débito (Catálogo 09 y 10 SUNAT)"
-                                >
-                                  <FileSpreadsheet className="w-3.5 h-3.5" />
-                                </button>
-                              </>
-                            )}
-
-                            {doc.status.includes('ACCEPTED') && doc.status !== 'ANULADO' && (
-                              <button
-                                onClick={() => handleAnularDocument(doc)}
-                                className="p-1.5 bg-rose-50 hover:bg-rose-100 text-rose-700 rounded-lg transition cursor-pointer"
-                                title="Anulación Formal Directa ante SUNAT (Emite Nota de Crédito Motivo 01)"
-                              >
-                                <Ban className="w-3.5 h-3.5" />
-                              </button>
-                            )}
-
-                            {doc.status === 'ANULADO' && (
-                              <span className="text-[10px] text-rose-500 font-bold px-2 py-0.5 bg-rose-50 rounded">
-                                Anulado
-                              </span>
-                            )}
-
-                            <button
-                              onClick={() => handleDeleteDocument(doc)}
-                              className="p-1.5 bg-slate-100 hover:bg-rose-100 text-slate-500 hover:text-rose-600 rounded-lg transition cursor-pointer"
-                              title="Eliminar registro de la Base de Datos"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
-                    {filteredDocRecords.length === 0 && (
+                        </React.Fragment>
+                      );
+                    })}
+                    {groupedDocTree.length === 0 && (
                       <tr>
-                        <td colSpan={8} className="py-12 text-center text-slate-400">
+                        <td colSpan={7} className="py-12 text-center text-slate-400">
                           No se encontraron comprobantes con los filtros seleccionados.
                         </td>
                       </tr>
@@ -4132,17 +5011,17 @@ export function App() {
               </div>
 
               {/* PAGINACIÓN DE COMPROBANTES */}
-              {filteredDocRecords.length > 0 && (
+              {groupedDocTree.length > 0 && (
                 <div className="px-5 py-3.5 bg-slate-50 border-t border-slate-100 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs text-slate-600">
                   <div className="flex items-center gap-2">
                     <span>Mostrando</span>
                     <span className="font-bold text-slate-900">
-                      {Math.min(filteredDocRecords.length, (docPage - 1) * docPageSize + 1)} -{" "}
-                      {Math.min(filteredDocRecords.length, docPage * docPageSize)}
+                      {Math.min(groupedDocTree.length, (docPage - 1) * docPageSize + 1)} -{" "}
+                      {Math.min(groupedDocTree.length, docPage * docPageSize)}
                     </span>
                     <span>de</span>
-                    <span className="font-bold text-slate-900">{filteredDocRecords.length}</span>
-                    <span>registros</span>
+                    <span className="font-bold text-slate-900">{groupedDocTree.length}</span>
+                    <span>operaciones</span>
                     <span className="text-slate-300 mx-1">|</span>
                     <div className="flex items-center gap-1.5">
                       <span>Por pág:</span>
@@ -4151,8 +5030,9 @@ export function App() {
                         onChange={(e) => setDocPageSize(Number(e.target.value))}
                         className="bg-white border border-slate-200 rounded-lg px-2 py-1 font-bold text-slate-800 outline-none cursor-pointer"
                       >
-                        <option value={10}>10</option>
-                        <option value={25}>25</option>
+                        <option value={6}>6</option>
+                        <option value={12}>12</option>
+                        <option value={24}>24</option>
                         <option value={50}>50</option>
                         <option value={100}>100</option>
                       </select>
@@ -4224,8 +5104,9 @@ export function App() {
 
             {/* Tarjetas KPI para Guías */}
             {(() => {
-              const guias = documents.filter(d => d.document_type === '09');
-              const guiasAceptadas = guias.filter(d => d.status.includes('ACCEPTED')).length;
+              const safeAllDocs = Array.isArray(documents) ? documents.filter(Boolean) : [];
+              const guias = safeAllDocs.filter(d => d.document_type === '09');
+              const guiasAceptadas = guias.filter(d => (d.status || '').includes('ACCEPTED')).length;
               const guiasPendientes = guias.filter(d => d.status === 'QUEUED' || d.status === 'SENDING').length;
               const guiasRechazadas = guias.filter(d => d.status === 'REJECTED' || d.status === 'FAILED_RETRY').length;
 
@@ -4329,18 +5210,10 @@ export function App() {
                             <button
                               type="button"
                               onClick={() => setDiagnosticDoc(doc)}
-                              title="Haz clic para ver el Diagnóstico Tributario Oficial retornado por SUNAT"
-                              className={`text-[10px] font-bold px-2.5 py-0.5 rounded-full cursor-pointer hover:opacity-85 transition inline-flex items-center gap-1 ${
-                                doc.status === 'ANULADO'
-                                  ? 'bg-rose-100 text-rose-800 border border-rose-300 font-extrabold line-through'
-                                  : doc.status.includes('ACCEPTED')
-                                  ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
-                                  : doc.status === 'QUEUED'
-                                  ? 'bg-amber-50 text-amber-700 border border-amber-200'
-                                  : 'bg-rose-50 text-rose-700 border border-rose-200'
-                              }`}
+                              title={`Diagnóstico Oficial SUNAT: ${getOfficialSunatStatus(doc).desc}`}
+                              className={`text-[10px] font-bold px-2.5 py-0.5 rounded-full cursor-pointer hover:opacity-85 transition inline-flex items-center gap-1 border ${getOfficialSunatStatus(doc).bgClass}`}
                             >
-                              <span>{doc.status}</span>
+                              <span>{getOfficialSunatStatus(doc).label}</span>
                               <Info className="w-2.5 h-2.5 opacity-60" />
                             </button>
                           </td>
@@ -4468,11 +5341,10 @@ export function App() {
                       )}
                       <p className="text-xs text-slate-500 mt-1">{comp.direccion}</p>
                     </div>
-                    <span className={`text-xs px-2.5 py-1 rounded-full font-bold shrink-0 ${
-                      comp.env_mode === 'PRODUCCION'
+                    <span className={`text-xs px-2.5 py-1 rounded-full font-bold shrink-0 ${comp.env_mode === 'PRODUCCION'
                         ? 'bg-rose-50 text-rose-700 border border-rose-200'
                         : 'bg-amber-50 text-amber-700 border border-amber-200'
-                    }`}>
+                      }`}>
                       {comp.env_mode}
                     </span>
                   </div>
@@ -4617,11 +5489,10 @@ export function App() {
 
                     <button
                       onClick={() => setCurrentCompany(comp)}
-                      className={`ml-auto text-xs px-3 py-1.5 rounded-xl font-bold transition cursor-pointer ${
-                        currentCompany?.id === comp.id
+                      className={`ml-auto text-xs px-3 py-1.5 rounded-xl font-bold transition cursor-pointer ${currentCompany?.id === comp.id
                           ? 'bg-emerald-600 text-white shadow-xs'
                           : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
-                      }`}
+                        }`}
                     >
                       {currentCompany?.id === comp.id ? '✓ Emisor Activo' : 'Seleccionar'}
                     </button>
@@ -4789,7 +5660,7 @@ export function App() {
                 <span className="text-xs text-indigo-700 font-bold">Autenticación por API Key</span>
               </div>
               <pre className="text-xs font-mono text-indigo-900 bg-white p-4 rounded-xl overflow-x-auto border border-slate-200 shadow-2xs font-semibold">
-{`x-api-key: ${currentCompany?.api_key || 'fact_demo_key_pro_2026'}
+                {`x-api-key: ${currentCompany?.api_key || 'fact_demo_key_pro_2026'}
 Content-Type: application/json
 Idempotency-Key: cco_order_987654 (Opcional pero recomendado para cero duplicados)`}
               </pre>
@@ -4931,10 +5802,10 @@ Idempotency-Key: cco_order_987654 (Opcional pero recomendado para cero duplicado
               </div>
 
               <p className="text-xs text-slate-700 leading-relaxed">
-                SUNAT pone a disposición de todos los desarrolladores un <strong>Ambiente Beta</strong> de pruebas públicas. 
-                En este entorno puedes emitir Facturas (<code className="font-mono bg-white px-1.5 py-0.5 rounded border border-amber-200">01</code>), 
-                Boletas (<code className="font-mono bg-white px-1.5 py-0.5 rounded border border-amber-200">03</code>), 
-                Notas de Crédito (<code className="font-mono bg-white px-1.5 py-0.5 rounded border border-amber-200">07</code>) 
+                SUNAT pone a disposición de todos los desarrolladores un <strong>Ambiente Beta</strong> de pruebas públicas.
+                En este entorno puedes emitir Facturas (<code className="font-mono bg-white px-1.5 py-0.5 rounded border border-amber-200">01</code>),
+                Boletas (<code className="font-mono bg-white px-1.5 py-0.5 rounded border border-amber-200">03</code>),
+                Notas de Crédito (<code className="font-mono bg-white px-1.5 py-0.5 rounded border border-amber-200">07</code>)
                 y Notas de Débito (<code className="font-mono bg-white px-1.5 py-0.5 rounded border border-amber-200">08</code>) recibiendo CDRs válidos de SUNAT sin generar pago de impuestos.
               </p>
 
@@ -5054,7 +5925,7 @@ Idempotency-Key: cco_order_987654 (Opcional pero recomendado para cero duplicado
                     <CheckCircle2 className="w-4 h-4 text-emerald-600" /> Sincronización Automática con Control Finanzas
                   </h4>
                   <p className="text-slate-600 leading-relaxed text-[11px]">
-                    Cuando eliminas una venta o boleta en <strong>Control Finanzas</strong>, el sistema llama automáticamente al endpoint <code className="font-mono bg-slate-100 px-1.5 py-0.5 rounded">DELETE /api/v1/documents/by-series-number/:serie/:numero</code> de CCOFACT PRO. 
+                    Cuando eliminas una venta o boleta en <strong>Control Finanzas</strong>, el sistema llama automáticamente al endpoint <code className="font-mono bg-slate-100 px-1.5 py-0.5 rounded">DELETE /api/v1/documents/by-series-number/:serie/:numero</code> de CCOFACT PRO.
                     El comprobante se elimina de la base de datos de facturación al instante, manteniendo ambos sistemas 100% sincronizados sin discrepancias.
                   </p>
                 </div>
@@ -5159,7 +6030,7 @@ Idempotency-Key: cco_order_987654 (Opcional pero recomendado para cero duplicado
                 <div>
                   <div className="flex items-center gap-2">
                     <span className="font-bold text-slate-900 text-base">{previewDoc.full_number}</span>
-                    <span className={`text-[11px] font-bold px-2 py-0.5 rounded-full ${previewDoc.status.includes('ACCEPTED') ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-amber-50 text-amber-700 border border-amber-200'}`}>
+                    <span className={`text-[11px] font-bold px-2 py-0.5 rounded-full ${(previewDoc.status || '').includes('ACCEPTED') ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-amber-50 text-amber-700 border border-amber-200'}`}>
                       {previewDoc.status}
                     </span>
                   </div>
@@ -5230,124 +6101,133 @@ Idempotency-Key: cco_order_987654 (Opcional pero recomendado para cero duplicado
       )}
 
       {/* MODAL 5: DIAGNÓSTICO DETALLADO DE ESTADO SUNAT */}
-      {diagnosticDoc && (
-        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-white border border-slate-200 rounded-3xl max-w-lg w-full p-6 shadow-2xl animate-in zoom-in-95 duration-200">
-            <div className="flex items-start justify-between mb-4">
-              <div className="flex items-center gap-3">
-                <div className={`w-10 h-10 rounded-2xl flex items-center justify-center ${
-                  diagnosticDoc.status.includes('ACCEPTED')
-                    ? 'bg-emerald-50 text-emerald-600'
-                    : diagnosticDoc.status === 'QUEUED'
-                    ? 'bg-amber-50 text-amber-600'
-                    : 'bg-rose-50 text-rose-600'
-                }`}>
-                  <ShieldCheck className="w-6 h-6" />
-                </div>
-                <div>
-                  <h3 className="font-extrabold text-slate-900 text-base">Diagnóstico Tributario SUNAT</h3>
-                  <p className="text-xs text-slate-500 font-mono">{diagnosticDoc.full_number}</p>
-                </div>
-              </div>
-              <button
-                onClick={() => setDiagnosticDoc(null)}
-                className="text-slate-400 hover:text-slate-700 text-sm font-bold p-1 cursor-pointer"
-              >
-                ✕
-              </button>
-            </div>
+      {diagnosticDoc && (() => {
+        const isAccepted = (diagnosticDoc.status || '').includes('ACCEPTED');
+        const isQueued = diagnosticDoc.status === 'QUEUED';
+        const diagGradient = isAccepted
+          ? 'bg-gradient-to-br from-emerald-500 to-teal-600 text-white shadow-emerald-500/25 ring-emerald-100'
+          : isQueued
+          ? 'bg-gradient-to-br from-amber-500 to-orange-600 text-white shadow-amber-500/25 ring-amber-100'
+          : 'bg-gradient-to-br from-rose-500 to-red-600 text-white shadow-rose-500/25 ring-rose-100';
 
-            <div className="space-y-3 my-4 text-xs">
-              <div className="bg-slate-50 p-3 rounded-xl border border-slate-200">
-                <span className="text-slate-500 font-medium block mb-1">Estado Registrado:</span>
-                <span className={`inline-block font-extrabold px-2.5 py-0.5 rounded-full ${
-                  diagnosticDoc.status.includes('ACCEPTED')
-                    ? 'bg-emerald-100 text-emerald-800'
-                    : diagnosticDoc.status === 'QUEUED'
-                    ? 'bg-amber-100 text-amber-800'
-                    : 'bg-rose-100 text-rose-800'
-                }`}>
-                  {diagnosticDoc.status}
-                </span>
+        return (
+          <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-md flex items-center justify-center p-4 animate-in fade-in duration-200">
+            <div className="bg-white border border-slate-200/80 rounded-3xl max-w-lg w-full p-6 shadow-2xl ring-1 ring-slate-900/10 animate-in zoom-in-95 duration-200 overflow-hidden">
+              <div className="flex items-start justify-between mb-4 pb-3 border-b border-slate-100">
+                <div className="flex items-center gap-3">
+                  <div className={`w-12 h-12 rounded-2xl flex items-center justify-center shadow-lg ring-4 ${diagGradient}`}>
+                    <ShieldCheck className="w-6 h-6" />
+                  </div>
+                  <div>
+                    <span className="inline-flex items-center gap-1.5 px-2 py-0.5 text-[10px] font-black uppercase tracking-wider rounded-full border border-slate-200/80 bg-slate-50 text-slate-600 mb-0.5">
+                      SUNAT CDR DIAGNÓSTICO
+                    </span>
+                    <h3 className="font-extrabold text-slate-900 text-base">Diagnóstico Tributario</h3>
+                    <p className="text-xs text-slate-500 font-mono font-bold">{diagnosticDoc.full_number}</p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setDiagnosticDoc(null)}
+                  className="p-1.5 text-slate-400 hover:text-slate-600 rounded-xl hover:bg-slate-100 transition-colors cursor-pointer"
+                >
+                  <X className="w-5 h-5" />
+                </button>
               </div>
 
-              {diagnosticDoc.sunat_response_code && (
-                <div className="bg-slate-50 p-3 rounded-xl border border-slate-200">
-                  <span className="text-slate-500 font-medium block mb-1">Código de Respuesta SUNAT:</span>
-                  <span className="font-mono font-bold text-slate-900">{diagnosticDoc.sunat_response_code}</span>
+              <div className="space-y-3 my-4 text-xs">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                  <div className="bg-gradient-to-br from-slate-50 to-slate-100/60 p-3.5 rounded-2xl border border-slate-200/70">
+                    <span className="text-slate-400 font-extrabold uppercase text-[10px] tracking-wider block mb-1">Estado Fiscal SUNAT:</span>
+                    <span className={`inline-block font-black px-2.5 py-0.5 rounded-full border shadow-2xs ${getOfficialSunatStatus(diagnosticDoc).bgClass}`}>
+                      {getOfficialSunatStatus(diagnosticDoc).label}
+                    </span>
+                  </div>
+                  <div className="bg-gradient-to-br from-slate-50 to-slate-100/60 p-3.5 rounded-2xl border border-slate-200/70">
+                    <span className="text-slate-400 font-extrabold uppercase text-[10px] tracking-wider block mb-1">Estado Comercial:</span>
+                    <span className={`inline-block font-black px-2.5 py-0.5 rounded-full border shadow-2xs ${getCommercialMovementStatus(diagnosticDoc).badgeClass}`}>
+                      {getCommercialMovementStatus(diagnosticDoc).badge}
+                    </span>
+                  </div>
                 </div>
-              )}
 
-              <div className="bg-slate-50 p-3 rounded-xl border border-slate-200">
-                <span className="text-slate-500 font-medium block mb-1">Detalle Oficial Retornado:</span>
-                <p className="text-slate-800 font-medium leading-relaxed">
-                  {diagnosticDoc.sunat_description || (diagnosticDoc.status.includes('ACCEPTED') ? 'Comprobante recibido y aceptado con éxito conforme a las especificaciones técnicas de SUNAT.' : 'Sin respuesta registrada.')}
-                </p>
-              </div>
+                {diagnosticDoc.sunat_response_code && (
+                  <div className="bg-slate-50 p-3 rounded-xl border border-slate-200/80 flex items-center justify-between">
+                    <span className="text-slate-500 font-medium text-xs">Código de Respuesta SUNAT:</span>
+                    <span className="font-mono font-black text-slate-900 bg-white px-2 py-0.5 rounded border border-slate-200 text-xs">{diagnosticDoc.sunat_response_code}</span>
+                  </div>
+                )}
 
-              {/* Guía Técnica Especializada para Error 0111 o 0140 */}
-              {(diagnosticDoc.sunat_response_code?.includes('0111') || diagnosticDoc.sunat_description?.includes('0111')) && (
-                <div className="bg-amber-50/80 border border-amber-200 p-3 rounded-xl text-amber-900">
-                  <span className="font-bold block mb-1">💡 Solución para Error 0111 (SUNAT):</span>
-                  <ol className="list-decimal list-inside space-y-1 text-[11px] text-amber-800">
-                    <li>Ingrese a SUNAT Operaciones en Línea con su Clave SOL principal.</li>
-                    <li>Vaya a <b>Administración de Usuarios Secundarios</b> y edite su usuario secundario.</li>
-                    <li>Asigne el perfil <b>"Comprobantes de Pago Electrónicos"</b>.</li>
-                    <li>Verifique que la empresa esté dada de alta en <b>SEE - Desde los Sistemas del Contribuyente</b>.</li>
-                  </ol>
-                </div>
-              )}
-
-              {(diagnosticDoc.sunat_response_code?.includes('0140') || diagnosticDoc.sunat_description?.includes('0140') || diagnosticDoc.status === 'QUEUED') && (
-                <div className="bg-blue-50/80 border border-blue-200 p-3 rounded-xl text-blue-900">
-                  <span className="font-bold block mb-1">⏳ Comprobante en Proceso (0140):</span>
-                  <p className="text-[11px] text-blue-800">
-                    SUNAT está validando el lote. No debe reenviar el archivo para no reiniciar el bloqueo de 15 minutos. Utilice el botón <b>"Consultar CDR en SUNAT"</b> para recuperar la constancia cuando SUNAT la libere.
+                <div className="bg-slate-50 p-3.5 rounded-2xl border border-slate-200/80">
+                  <span className="text-slate-400 font-extrabold uppercase text-[10px] tracking-wider block mb-1">Detalle Oficial Retornado:</span>
+                  <p className="text-slate-800 font-medium leading-relaxed">
+                    {diagnosticDoc.sunat_description || ((diagnosticDoc.status || '').includes('ACCEPTED') ? 'Comprobante recibido y aceptado con éxito conforme a las especificaciones técnicas de SUNAT.' : 'Sin respuesta registrada.')}
                   </p>
                 </div>
-              )}
-            </div>
 
-            <div className="flex items-center justify-end gap-2 mt-5 pt-3 border-t border-slate-100">
-              <button
-                type="button"
-                onClick={() => setDiagnosticDoc(null)}
-                className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl font-bold text-xs transition cursor-pointer"
-              >
-                Cerrar
-              </button>
+                {/* Guía Técnica Especializada para Error 0111 o 0140 */}
+                {(diagnosticDoc.sunat_response_code?.includes('0111') || diagnosticDoc.sunat_description?.includes('0111')) && (
+                  <div className="bg-amber-50/80 border border-amber-200 p-3 rounded-xl text-amber-900">
+                    <span className="font-bold block mb-1">💡 Solución para Error 0111 (SUNAT):</span>
+                    <ol className="list-decimal list-inside space-y-1 text-[11px] text-amber-800">
+                      <li>Ingrese a SUNAT Operaciones en Línea con su Clave SOL principal.</li>
+                      <li>Vaya a <b>Administración de Usuarios Secundarios</b> y edite su usuario secundario.</li>
+                      <li>Asigne el perfil <b>"Comprobantes de Pago Electrónicos"</b>.</li>
+                      <li>Verifique que la empresa esté dada de alta en <b>SEE - Desde los Sistemas del Contribuyente</b>.</li>
+                    </ol>
+                  </div>
+                )}
 
-              {(diagnosticDoc.status === 'QUEUED' || diagnosticDoc.sunat_response_code?.includes('0140')) && (
+                {(diagnosticDoc.sunat_response_code?.includes('0140') || diagnosticDoc.sunat_description?.includes('0140') || diagnosticDoc.status === 'QUEUED') && (
+                  <div className="bg-blue-50/80 border border-blue-200 p-3 rounded-xl text-blue-900">
+                    <span className="font-bold block mb-1">⏳ Comprobante en Proceso (0140):</span>
+                    <p className="text-[11px] text-blue-800">
+                      SUNAT está validando el lote. No debe reenviar el archivo para no reiniciar el bloqueo de 15 minutos. Utilice el botón <b>"Consultar CDR en SUNAT"</b> para recuperar la constancia cuando SUNAT la libere.
+                    </p>
+                  </div>
+                )}
+              </div>
+
+              <div className="flex items-center justify-end gap-2 mt-5 pt-3 border-t border-slate-100">
                 <button
                   type="button"
-                  onClick={() => {
-                    const id = diagnosticDoc.id;
-                    setDiagnosticDoc(null);
-                    handleConsultarCdr(id);
-                  }}
-                  className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-bold text-xs transition cursor-pointer shadow-md shadow-indigo-600/20 flex items-center gap-1.5"
+                  onClick={() => setDiagnosticDoc(null)}
+                  className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl font-bold text-xs transition cursor-pointer"
                 >
-                  <Search className="w-3.5 h-3.5" /> Consultar CDR Oficial
+                  Cerrar
                 </button>
-              )}
 
-              {diagnosticDoc.status !== 'ACCEPTED' && diagnosticDoc.status !== 'ANULADO' && !diagnosticDoc.sunat_response_code?.includes('0140') && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    const id = diagnosticDoc.id;
-                    setDiagnosticDoc(null);
-                    handleRetry(id);
-                  }}
-                  className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl font-bold text-xs transition cursor-pointer shadow-md shadow-amber-600/20 flex items-center gap-1.5"
-                >
-                  <RotateCw className="w-3.5 h-3.5" /> Reintentar Envío
-                </button>
-              )}
+                {(diagnosticDoc.status === 'QUEUED' || diagnosticDoc.sunat_response_code?.includes('0140')) && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const id = diagnosticDoc.id;
+                      setDiagnosticDoc(null);
+                      handleConsultarCdr(id);
+                    }}
+                    className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-bold text-xs transition cursor-pointer shadow-md shadow-indigo-600/20 flex items-center gap-1.5"
+                  >
+                    <Search className="w-3.5 h-3.5" /> Consultar CDR Oficial
+                  </button>
+                )}
+
+                {diagnosticDoc.status !== 'ACCEPTED' && diagnosticDoc.status !== 'ANULADO' && !diagnosticDoc.sunat_response_code?.includes('0140') && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const id = diagnosticDoc.id;
+                      setDiagnosticDoc(null);
+                      handleRetry(id);
+                    }}
+                    className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl font-bold text-xs transition cursor-pointer shadow-md shadow-amber-600/20 flex items-center gap-1.5"
+                  >
+                    <RotateCw className="w-3.5 h-3.5" /> Reintentar Envío
+                  </button>
+                )}
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* MODAL CENTRALIZADO DE CONFIRMACIÓN OBLIGATORIA (CONFIRMAR / CANCELAR) */}
       <ConfirmModal
@@ -5370,31 +6250,34 @@ Idempotency-Key: cco_order_987654 (Opcional pero recomendado para cero duplicado
       {fiscalAnnulModal.isOpen && fiscalAnnulModal.doc && (() => {
         const doc = fiscalAnnulModal.doc;
         const isFactura = doc.document_type === '01';
+        const hasNotes = (fiscalAnnulModal.notes || []).length > 0;
+        const remaining = fiscalAnnulModal.remainingBalance > 0 ? fiscalAnnulModal.remainingBalance : Number(doc.total_amount || 0);
 
         return (
-          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-200">
-            <div className="bg-white rounded-2xl shadow-2xl max-w-lg w-full border border-slate-200 overflow-hidden">
-              {/* Header */}
-              <div className="p-5 flex items-start gap-4 border-b border-rose-100 bg-rose-50/40">
-                <div className="w-12 h-12 rounded-xl flex items-center justify-center shrink-0 bg-rose-100 ring-4 ring-rose-50 text-rose-600">
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-md animate-in fade-in duration-200">
+            <div className="bg-white rounded-3xl shadow-2xl max-w-lg w-full border border-slate-200/80 overflow-hidden ring-1 ring-slate-900/10">
+              {/* Header con gradiente elegante y micro-interacción */}
+              <div className="p-5 flex items-start gap-4 border-b border-rose-100/80 bg-gradient-to-r from-rose-500/10 via-rose-50/40 to-transparent">
+                <div className="w-12 h-12 rounded-2xl flex items-center justify-center shrink-0 bg-gradient-to-br from-rose-500 to-red-600 text-white shadow-lg shadow-rose-500/25 ring-4 ring-rose-100">
                   <Ban className="w-6 h-6" />
                 </div>
                 <div className="flex-1 min-w-0">
-                  <span className="inline-block px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider rounded border border-rose-200 bg-rose-50 text-rose-700 mb-1">
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 text-[10px] font-black uppercase tracking-wider rounded-full border border-rose-200/80 bg-rose-50 text-rose-700 shadow-2xs mb-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-rose-500 animate-pulse" />
                     ANULACIÓN TRIBUTARIA SUNAT &bull; UBL 2.1
                   </span>
-                  <h3 className="text-lg font-bold text-slate-900 leading-snug">
+                  <h3 className="text-lg font-extrabold text-slate-900 leading-snug">
                     Anular {doc.full_number}
                   </h3>
-                  <p className="text-xs text-slate-500 font-medium">
-                    Cliente: <strong>{doc.client_name}</strong> &bull; Total: <strong>S/ {Number(doc.total_amount).toFixed(2)}</strong>
+                  <p className="text-xs text-slate-500 font-medium truncate mt-0.5">
+                    Cliente: <strong className="text-slate-800">{doc.client_name}</strong>
                   </p>
                 </div>
                 <button
                   type="button"
                   onClick={() => setFiscalAnnulModal(prev => ({ ...prev, isOpen: false, doc: null }))}
                   disabled={fiscalAnnulModal.loading}
-                  className="p-1 text-slate-400 hover:text-slate-600 rounded-lg hover:bg-slate-100 transition-colors"
+                  className="p-1.5 text-slate-400 hover:text-slate-600 rounded-xl hover:bg-slate-100 transition-colors"
                 >
                   <X className="w-5 h-5" />
                 </button>
@@ -5402,34 +6285,62 @@ Idempotency-Key: cco_order_987654 (Opcional pero recomendado para cero duplicado
 
               {/* Body */}
               <div className="p-5 space-y-4 max-h-[70vh] overflow-y-auto">
-                <div className="p-3.5 bg-blue-50/60 border border-blue-200 rounded-xl text-xs space-y-1.5">
-                  <span className="font-black text-blue-900 block">Normativa SUNAT Vigente:</span>
+                {/* Mini card resumen financiero con 3 columnas estilizadas */}
+                <div className="grid grid-cols-3 gap-2 p-3 bg-gradient-to-br from-slate-50 to-slate-100/60 rounded-2xl border border-slate-200/70 text-center">
+                  <div className="p-2">
+                    <span className="text-[10px] font-bold text-slate-400 uppercase block tracking-wider">Comprobante</span>
+                    <span className="font-mono font-black text-slate-800 text-xs truncate block">{doc.full_number}</span>
+                  </div>
+                  <div className="p-2 border-x border-slate-200/60">
+                    <span className="text-[10px] font-bold text-slate-400 uppercase block tracking-wider">Total Orig</span>
+                    <span className="font-mono font-bold text-slate-700 text-xs block">{doc.currency === 'USD' ? '$' : 'S/'} {Number(doc.total_amount).toFixed(2)}</span>
+                  </div>
+                  <div className="p-2 bg-rose-50 rounded-xl border border-rose-200/70">
+                    <span className="text-[10px] font-black text-rose-600 uppercase block tracking-wider">A Liquidar</span>
+                    <span className="font-mono font-black text-rose-700 text-xs sm:text-sm block">{doc.currency === 'USD' ? '$' : 'S/'} {remaining.toFixed(2)}</span>
+                  </div>
+                </div>
+
+                <div className="p-3.5 bg-blue-50/70 border border-blue-200/80 rounded-2xl text-xs space-y-1.5">
+                  <span className="font-extrabold text-blue-950 flex items-center gap-1.5">
+                    <FileText className="w-3.5 h-3.5 text-blue-600" />
+                    Normativa SUNAT & Trazabilidad Contable:
+                  </span>
                   <p className="text-slate-700 leading-relaxed font-medium">
-                    El comprobante se anulará formalmente emitiendo una <strong>Nota de Crédito Electrónica ({isFactura ? 'FC01' : 'BC01'})</strong> bajo el Catálogo 09 Motivo 01 (Anulación de la operación).
+                    {hasNotes ? (
+                      <>
+                        Este comprobante cuenta con <strong>{fiscalAnnulModal.notes.length} comprobante(s) de ajuste vinculados</strong> previamente. La <strong>Nota de Crédito Electrónica ({isFactura ? 'FC01' : 'BC01'})</strong> se emitirá bajo el Catálogo 09 Motivo 01 (Anulación de la operación) por el <strong>saldo remanente exacto de {doc.currency === 'USD' ? '$' : 'S/'} {remaining.toFixed(2)}</strong>, extinguiendo la operación y dejando el balance final en <strong>S/ 0.00</strong>.
+                      </>
+                    ) : (
+                      <>
+                        El comprobante se anulará formalmente ante SUNAT emitiendo una <strong>Nota de Crédito Electrónica ({isFactura ? 'FC01' : 'BC01'})</strong> bajo el Catálogo 09 Motivo 01 (Anulación de la operación) por el total de <strong>{doc.currency === 'USD' ? '$' : 'S/'} {Number(doc.total_amount).toFixed(2)}</strong>.
+                      </>
+                    )}
                   </p>
                 </div>
 
                 {/* Motivo de Anulación */}
                 <div>
-                  <label className="block text-[11px] font-bold text-slate-600 uppercase mb-1">
+                  <label className="block text-[11px] font-extrabold text-slate-700 uppercase tracking-wider mb-1.5">
                     Sustento del Motivo ante SUNAT:
                   </label>
                   <input
                     type="text"
                     value={fiscalAnnulModal.motivo}
                     onChange={(e) => setFiscalAnnulModal(prev => ({ ...prev, motivo: e.target.value }))}
-                    className="w-full px-3.5 py-2.5 text-xs border border-slate-300 rounded-xl outline-none focus:ring-2 focus:ring-rose-500 font-medium"
+                    placeholder="Ingrese el sustento tributario..."
+                    className="w-full px-4 py-2.5 text-xs bg-slate-50/60 border border-slate-200 rounded-xl outline-none focus:bg-white focus:ring-4 focus:ring-rose-500/15 focus:border-rose-400 transition-all font-medium text-slate-800"
                   />
                 </div>
               </div>
 
               {/* Footer */}
-              <div className="p-4 bg-slate-50 border-t border-slate-200 flex justify-end gap-2.5">
+              <div className="p-4 bg-slate-50/80 border-t border-slate-200/80 flex justify-end gap-2.5">
                 <button
                   type="button"
                   onClick={() => setFiscalAnnulModal(prev => ({ ...prev, isOpen: false, doc: null }))}
                   disabled={fiscalAnnulModal.loading}
-                  className="px-4 py-2 text-xs font-bold text-slate-600 hover:text-slate-800 transition"
+                  className="px-4 py-2 text-xs font-bold text-slate-600 hover:text-slate-800 hover:bg-slate-100 rounded-xl transition"
                 >
                   Cancelar
                 </button>
@@ -5437,9 +6348,10 @@ Idempotency-Key: cco_order_987654 (Opcional pero recomendado para cero duplicado
                   type="button"
                   onClick={handleConfirmFiscalAnnulment}
                   disabled={fiscalAnnulModal.loading}
-                  className="px-5 py-2.5 text-xs font-bold text-white bg-rose-600 hover:bg-rose-700 shadow-md shadow-rose-600/20 rounded-xl transition disabled:opacity-50 flex items-center gap-1.5"
+                  className="px-5 py-2.5 text-xs font-black text-white bg-gradient-to-r from-rose-600 via-rose-500 to-red-600 hover:from-rose-700 hover:to-red-700 shadow-lg shadow-rose-600/30 rounded-xl transition-all active:scale-95 flex items-center gap-2 cursor-pointer disabled:opacity-50"
                 >
-                  {fiscalAnnulModal.loading ? 'Emitiendo Nota en SUNAT...' : 'Emitir Nota de Crédito Oficial'}
+                  <Ban className="w-3.5 h-3.5" />
+                  {fiscalAnnulModal.loading ? 'Emitiendo Nota en SUNAT...' : `Emitir Nota de Crédito por ${doc.currency === 'USD' ? '$' : 'S/'} ${remaining.toFixed(2)}`}
                 </button>
               </div>
             </div>
@@ -5449,18 +6361,19 @@ Idempotency-Key: cco_order_987654 (Opcional pero recomendado para cero duplicado
 
       {/* MODAL INTELIGENTE: EDICIÓN CON DIFF ENGINE (SUNAT UBL 2.1) */}
       {smartEditModal.isOpen && smartEditModal.doc && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-200">
-          <div className="bg-white rounded-2xl shadow-2xl max-w-2xl w-full border border-slate-200 overflow-hidden">
-            {/* Header */}
-            <div className="p-5 flex items-start gap-4 border-b border-indigo-100 bg-indigo-50/40">
-              <div className="w-12 h-12 rounded-xl flex items-center justify-center shrink-0 bg-indigo-600 text-white shadow-md shadow-indigo-600/20">
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-md animate-in fade-in duration-200">
+          <div className="bg-white rounded-3xl shadow-2xl max-w-2xl w-full border border-slate-200/80 overflow-hidden ring-1 ring-slate-900/10">
+            {/* Header con diseño elegante y micro-interacción */}
+            <div className="p-5 flex items-start gap-4 border-b border-indigo-100/80 bg-gradient-to-r from-indigo-500/10 via-indigo-50/40 to-transparent">
+              <div className="w-12 h-12 rounded-2xl flex items-center justify-center shrink-0 bg-gradient-to-br from-indigo-600 via-indigo-500 to-purple-600 text-white shadow-lg shadow-indigo-600/25 ring-4 ring-indigo-100">
                 <Wand2 className="w-6 h-6" />
               </div>
               <div className="flex-1 min-w-0">
-                <span className="inline-block px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider rounded border border-indigo-200 bg-indigo-50 text-indigo-700 mb-1">
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 text-[10px] font-black uppercase tracking-wider rounded-full border border-indigo-200/80 bg-indigo-50 text-indigo-700 shadow-2xs mb-1">
+                  <span className="w-1.5 h-1.5 rounded-full bg-indigo-500 animate-pulse" />
                   DIFF ENGINE INTELIGENTE &bull; SUNAT UBL 2.1
                 </span>
-                <h3 className="text-lg font-bold text-slate-900 leading-snug">
+                <h3 className="text-lg font-extrabold text-slate-900 leading-snug">
                   Edición Inteligente de {smartEditModal.doc.full_number}
                 </h3>
                 <p className="text-xs text-slate-500 font-medium">
@@ -5471,7 +6384,7 @@ Idempotency-Key: cco_order_987654 (Opcional pero recomendado para cero duplicado
                 type="button"
                 onClick={() => setSmartEditModal(prev => ({ ...prev, isOpen: false, doc: null }))}
                 disabled={smartEditModal.loading}
-                className="p-1 text-slate-400 hover:text-slate-600 rounded-lg hover:bg-slate-100 transition-colors"
+                className="p-1.5 text-slate-400 hover:text-slate-600 rounded-xl hover:bg-slate-100 transition-colors"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -5550,14 +6463,14 @@ Idempotency-Key: cco_order_987654 (Opcional pero recomendado para cero duplicado
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100">
-                      {smartEditModal.items.map((it, idx) => (
+                      {(smartEditModal.items || []).map((it, idx) => (
                         <tr key={idx}>
                           <td className="py-1.5 px-3">
                             <input
                               type="text"
                               value={it.name}
                               onChange={(e) => {
-                                const next = [...smartEditModal.items];
+                                const next = [...(smartEditModal.items || [])];
                                 next[idx].name = e.target.value;
                                 setSmartEditModal(prev => ({ ...prev, items: next }));
                               }}
@@ -5611,12 +6524,12 @@ Idempotency-Key: cco_order_987654 (Opcional pero recomendado para cero duplicado
             </div>
 
             {/* Footer */}
-            <div className="p-4 bg-slate-50 border-t border-slate-200 flex justify-end gap-2.5">
+            <div className="p-4 bg-slate-50/80 border-t border-slate-200/80 flex justify-end gap-2.5">
               <button
                 type="button"
                 onClick={() => setSmartEditModal(prev => ({ ...prev, isOpen: false, doc: null }))}
                 disabled={smartEditModal.loading}
-                className="px-4 py-2 text-xs font-bold text-slate-600 hover:text-slate-800 transition"
+                className="px-4 py-2 text-xs font-bold text-slate-600 hover:text-slate-800 hover:bg-slate-100 rounded-xl transition"
               >
                 Cancelar
               </button>
@@ -5624,8 +6537,9 @@ Idempotency-Key: cco_order_987654 (Opcional pero recomendado para cero duplicado
                 type="button"
                 onClick={handleConfirmSmartEdit}
                 disabled={smartEditModal.loading}
-                className="px-5 py-2.5 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 shadow-md shadow-indigo-600/20 rounded-xl transition disabled:opacity-50 flex items-center gap-1.5"
+                className="px-5 py-2.5 text-xs font-black text-white bg-gradient-to-r from-indigo-600 via-indigo-500 to-purple-600 hover:from-indigo-700 hover:to-purple-700 shadow-lg shadow-indigo-600/30 rounded-xl transition-all active:scale-95 disabled:opacity-50 flex items-center gap-2 cursor-pointer"
               >
+                <Wand2 className="w-3.5 h-3.5" />
                 {smartEditModal.loading ? 'Procesando Diff Engine...' : 'Ejecutar Edición Inteligente'}
               </button>
             </div>
@@ -5635,29 +6549,30 @@ Idempotency-Key: cco_order_987654 (Opcional pero recomendado para cero duplicado
 
       {/* MODAL AVANZADO: EMISIÓN MANUAL DE NOTA (CATÁLOGO 09 Y 10 SUNAT) */}
       {manualNoteModal.isOpen && manualNoteModal.doc && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-200">
-          <div className="bg-white rounded-2xl shadow-2xl max-w-lg w-full border border-slate-200 overflow-hidden">
-            {/* Header */}
-            <div className="p-5 flex items-start gap-4 border-b border-purple-100 bg-purple-50/40">
-              <div className="w-12 h-12 rounded-xl flex items-center justify-center shrink-0 bg-purple-600 text-white shadow-md shadow-purple-600/20">
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-md animate-in fade-in duration-200">
+          <div className="bg-white rounded-3xl shadow-2xl max-w-lg w-full border border-slate-200/80 overflow-hidden ring-1 ring-slate-900/10">
+            {/* Header con gradiente elegante */}
+            <div className="p-5 flex items-start gap-4 border-b border-purple-100/80 bg-gradient-to-r from-purple-500/10 via-indigo-50/40 to-transparent">
+              <div className="w-12 h-12 rounded-2xl flex items-center justify-center shrink-0 bg-gradient-to-br from-purple-600 via-indigo-600 to-purple-700 text-white shadow-lg shadow-purple-600/25 ring-4 ring-purple-100">
                 <FileSpreadsheet className="w-6 h-6" />
               </div>
               <div className="flex-1 min-w-0">
-                <span className="inline-block px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider rounded border border-purple-200 bg-purple-50 text-purple-700 mb-1">
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 text-[10px] font-black uppercase tracking-wider rounded-full border border-purple-200/80 bg-purple-50 text-purple-700 shadow-2xs mb-1">
+                  <span className="w-1.5 h-1.5 rounded-full bg-purple-500 animate-pulse" />
                   EMISIÓN MANUAL DE NOTA &bull; MODO CONTADOR
                 </span>
-                <h3 className="text-lg font-bold text-slate-900 leading-snug">
+                <h3 className="text-lg font-extrabold text-slate-900 leading-snug">
                   Nota para {manualNoteModal.doc.full_number}
                 </h3>
-                <p className="text-xs text-slate-500 font-medium">
-                  Comprobante base: {manualNoteModal.doc.full_number} &bull; Total: S/ {Number(manualNoteModal.doc.total_amount).toFixed(2)}
+                <p className="text-xs text-slate-500 font-medium truncate mt-0.5">
+                  Cliente: <strong className="text-slate-800">{manualNoteModal.doc.client_name}</strong>
                 </p>
               </div>
               <button
                 type="button"
                 onClick={() => setManualNoteModal(prev => ({ ...prev, isOpen: false, doc: null }))}
                 disabled={manualNoteModal.loading}
-                className="p-1 text-slate-400 hover:text-slate-600 rounded-lg hover:bg-slate-100 transition-colors"
+                className="p-1.5 text-slate-400 hover:text-slate-600 rounded-xl hover:bg-slate-100 transition-colors"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -5665,35 +6580,113 @@ Idempotency-Key: cco_order_987654 (Opcional pero recomendado para cero duplicado
 
             {/* Form */}
             <div className="p-5 space-y-4 max-h-[70vh] overflow-y-auto">
-              <div className="grid grid-cols-2 gap-2 p-1 bg-slate-100 rounded-xl">
-                <button
-                  type="button"
-                  onClick={() => setManualNoteModal(prev => ({ ...prev, noteType: '07', reasonCode: '01' }))}
-                  className={`py-2 text-xs font-black rounded-lg transition ${
-                    manualNoteModal.noteType === '07' ? 'bg-white text-rose-600 shadow-sm' : 'text-slate-500'
+              {/* Mini card de balance financiero */}
+              <div className="grid grid-cols-3 gap-2 p-3 bg-gradient-to-br from-slate-50 to-slate-100/60 rounded-2xl border border-slate-200/70 text-center">
+                <div className="p-2">
+                  <span className="text-[10px] font-bold text-slate-400 uppercase block tracking-wider">Base</span>
+                  <span className="font-mono font-black text-slate-800 text-xs truncate block">{manualNoteModal.doc.full_number}</span>
+                </div>
+                <div className="p-2 border-x border-slate-200/60">
+                  <span className="text-[10px] font-bold text-slate-400 uppercase block tracking-wider">Total Orig</span>
+                  <span className="font-mono font-bold text-slate-700 text-xs block">S/ {Number(manualNoteModal.doc.total_amount).toFixed(2)}</span>
+                </div>
+                <div
+                  className={`p-2 rounded-xl border ${
+                    manualNoteModal.remainingBalance <= 0.009
+                      ? 'bg-rose-50 border-rose-200 text-rose-700'
+                      : 'bg-emerald-50 border-emerald-200 text-emerald-800'
                   }`}
                 >
+                  <span className="text-[10px] font-black uppercase block tracking-wider">Saldo Remanente</span>
+                  <span className="font-mono font-black text-xs sm:text-sm block">S/ {manualNoteModal.remainingBalance.toFixed(2)}</span>
+                </div>
+              </div>
+
+              {manualNoteModal.remainingBalance <= 0.009 && (
+                <div className="p-3.5 bg-rose-50/80 border border-rose-200 rounded-2xl text-xs text-rose-800 flex items-start gap-2.5">
+                  <Ban className="w-4 h-4 text-rose-600 mt-0.5 shrink-0" />
+                  <div>
+                    <strong className="block font-black text-rose-900">Comprobante sin saldo disponible (S/ 0.00):</strong>
+                    <p className="mt-0.5 text-[11px] text-rose-700 leading-relaxed font-medium">
+                      Este comprobante ya ha sido liquidado o anulado en su totalidad. La normativa UBL 2.1 de SUNAT no permite emitir Notas de Crédito adicionales ni Notas de Débito sobre comprobantes cancelados.
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {/* Selector de Tipo de Nota con diseño segmentado moderno */}
+              <div className="grid grid-cols-2 gap-1.5 p-1.5 bg-slate-100/80 border border-slate-200/80 rounded-2xl">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const defaultR = SUNAT_CAT_09[0];
+                    setManualNoteModal(prev => ({
+                      ...prev,
+                      noteType: '07',
+                      reasonCode: defaultR.code,
+                      reasonText: defaultR.desc,
+                      amount: prev.remainingBalance,
+                    }));
+                  }}
+                  className={`py-2 px-3 text-xs font-black rounded-xl transition-all flex items-center justify-center gap-1.5 ${
+                    manualNoteModal.noteType === '07'
+                      ? 'bg-white text-rose-600 shadow-sm border border-rose-100 ring-1 ring-black/5'
+                      : 'text-slate-500 hover:text-slate-800'
+                  }`}
+                >
+                  <Receipt className="w-3.5 h-3.5" />
                   Nota de Crédito (Tipo 07)
                 </button>
                 <button
                   type="button"
-                  onClick={() => setManualNoteModal(prev => ({ ...prev, noteType: '08', reasonCode: '02' }))}
-                  className={`py-2 text-xs font-black rounded-lg transition ${
-                    manualNoteModal.noteType === '08' ? 'bg-white text-purple-600 shadow-sm' : 'text-slate-500'
+                  onClick={() => {
+                    const defaultR = SUNAT_CAT_10.find(r => r.code === '02') || SUNAT_CAT_10[0];
+                    setManualNoteModal(prev => ({
+                      ...prev,
+                      noteType: '08',
+                      reasonCode: defaultR.code,
+                      reasonText: defaultR.desc,
+                      amount: 10,
+                    }));
+                  }}
+                  className={`py-2 px-3 text-xs font-black rounded-xl transition-all flex items-center justify-center gap-1.5 ${
+                    manualNoteModal.noteType === '08'
+                      ? 'bg-white text-purple-600 shadow-sm border border-purple-100 ring-1 ring-black/5'
+                      : 'text-slate-500 hover:text-slate-800'
                   }`}
                 >
+                  <FileSpreadsheet className="w-3.5 h-3.5" />
                   Nota de Débito (Tipo 08)
                 </button>
               </div>
 
               <div>
-                <label className="block text-[11px] font-bold text-slate-600 uppercase mb-1">
+                <label className="block text-[11px] font-extrabold text-slate-700 uppercase tracking-wider mb-1.5">
                   Motivo Oficial ({manualNoteModal.noteType === '07' ? 'Catálogo 09 SUNAT' : 'Catálogo 10 SUNAT'}):
                 </label>
                 <select
                   value={manualNoteModal.reasonCode}
-                  onChange={(e) => setManualNoteModal(prev => ({ ...prev, reasonCode: e.target.value }))}
-                  className="w-full text-xs font-bold bg-white border border-slate-300 rounded-xl p-2.5 outline-none focus:ring-2 focus:ring-purple-500"
+                  onChange={(e) => {
+                    const code = e.target.value;
+                    const desc = (manualNoteModal.noteType === '07' ? SUNAT_CAT_09 : SUNAT_CAT_10).find(r => r.code === code)?.desc || '';
+                    let newAmount = manualNoteModal.amount;
+                    if (manualNoteModal.noteType === '07') {
+                      if (code === '03') {
+                        newAmount = 0;
+                      } else if (['01', '02', '06'].includes(code)) {
+                        newAmount = manualNoteModal.remainingBalance;
+                      } else if (newAmount > manualNoteModal.remainingBalance) {
+                        newAmount = manualNoteModal.remainingBalance;
+                      }
+                    }
+                    setManualNoteModal(prev => ({
+                      ...prev,
+                      reasonCode: code,
+                      reasonText: desc,
+                      amount: newAmount,
+                    }));
+                  }}
+                  className="w-full text-xs font-bold bg-slate-50/60 hover:bg-slate-50 border border-slate-200 rounded-xl p-2.5 outline-none focus:bg-white focus:ring-4 focus:ring-purple-500/15 focus:border-purple-400 transition-all text-slate-800 cursor-pointer"
                 >
                   {(manualNoteModal.noteType === '07' ? SUNAT_CAT_09 : SUNAT_CAT_10).map(r => (
                     <option key={r.code} value={r.code}>
@@ -5704,7 +6697,7 @@ Idempotency-Key: cco_order_987654 (Opcional pero recomendado para cero duplicado
               </div>
 
               <div>
-                <label className="block text-[11px] font-bold text-slate-600 uppercase mb-1">
+                <label className="block text-[11px] font-extrabold text-slate-700 uppercase tracking-wider mb-1.5">
                   Sustento Detallado (XML SUNAT):
                 </label>
                 <input
@@ -5712,49 +6705,88 @@ Idempotency-Key: cco_order_987654 (Opcional pero recomendado para cero duplicado
                   value={manualNoteModal.reasonText}
                   onChange={(e) => setManualNoteModal(prev => ({ ...prev, reasonText: e.target.value }))}
                   placeholder="Sustento tributario del motivo..."
-                  className="w-full px-3.5 py-2.5 text-xs border border-slate-300 rounded-xl outline-none focus:ring-2 focus:ring-purple-500 font-medium"
+                  className="w-full px-4 py-2.5 text-xs bg-slate-50/60 border border-slate-200 rounded-xl outline-none focus:bg-white focus:ring-4 focus:ring-purple-500/15 focus:border-purple-400 transition-all font-medium text-slate-800"
                 />
               </div>
 
-              <div className="grid grid-cols-2 gap-3 bg-slate-50 p-3 rounded-xl border border-slate-200">
+              <div className="grid grid-cols-2 gap-3 bg-gradient-to-br from-slate-50 to-slate-100/60 p-3.5 rounded-2xl border border-slate-200/80">
                 <div>
-                  <label className="block text-[11px] font-bold text-slate-600 mb-1">Importe Nota (S/)</label>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <label className="block text-[11px] font-extrabold text-slate-700">Importe Nota (S/)</label>
+                    {manualNoteModal.noteType === '07' && ['01', '02', '06'].includes(manualNoteModal.reasonCode) && (
+                      <span className="text-[10px] text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded border border-amber-200 font-black">Fijo Saldo</span>
+                    )}
+                    {manualNoteModal.noteType === '07' && manualNoteModal.reasonCode === '03' && (
+                      <span className="text-[10px] text-purple-700 bg-purple-50 px-1.5 py-0.5 rounded border border-purple-200 font-black">S/ 0.00</span>
+                    )}
+                  </div>
                   <input
                     type="number"
                     step="0.01"
-                    value={manualNoteModal.amount}
-                    onChange={(e) => setManualNoteModal(prev => ({ ...prev, amount: parseFloat(e.target.value) || 0 }))}
-                    className="w-full text-xs font-mono font-bold bg-white border border-slate-200 rounded-lg p-2"
+                    min="0"
+                    max={manualNoteModal.noteType === '07' ? manualNoteModal.remainingBalance : undefined}
+                    readOnly={manualNoteModal.noteType === '07' && (['01', '02', '06'].includes(manualNoteModal.reasonCode) || manualNoteModal.reasonCode === '03')}
+                    value={
+                      manualNoteModal.noteType === '07' && manualNoteModal.reasonCode === '03'
+                        ? 0
+                        : manualNoteModal.noteType === '07' && ['01', '02', '06'].includes(manualNoteModal.reasonCode)
+                          ? manualNoteModal.remainingBalance
+                          : manualNoteModal.amount
+                    }
+                    onChange={(e) => {
+                      const val = parseFloat(e.target.value) || 0;
+                      const maxVal = manualNoteModal.noteType === '07' ? manualNoteModal.remainingBalance : 999999999;
+                      setManualNoteModal(prev => ({ ...prev, amount: Math.min(val, maxVal) }));
+                    }}
+                    className={`w-full text-xs font-mono font-bold border rounded-xl p-2.5 transition-all outline-none ${
+                      manualNoteModal.noteType === '07' && (['01', '02', '06'].includes(manualNoteModal.reasonCode) || manualNoteModal.reasonCode === '03')
+                        ? 'bg-slate-100 text-slate-500 border-slate-300 cursor-not-allowed shadow-inner'
+                        : 'bg-white text-slate-900 border-slate-200 focus:ring-4 focus:ring-purple-500/15 focus:border-purple-400'
+                    }`}
                   />
+                  {manualNoteModal.noteType === '07' && (
+                    <p className="text-[10px] text-slate-500 mt-1.5 font-medium leading-tight">
+                      {manualNoteModal.reasonCode === '03'
+                        ? 'Motivo 03: Corrección por error en descripción no altera valor contable.'
+                        : ['01', '02', '06'].includes(manualNoteModal.reasonCode)
+                          ? `Anulación total: emitirá nota por el saldo exacto de S/ ${manualNoteModal.remainingBalance.toFixed(2)}.`
+                          : `Máximo permitido: Saldo remanente de S/ ${manualNoteModal.remainingBalance.toFixed(2)}.`}
+                    </p>
+                  )}
                 </div>
                 <div>
-                  <label className="block text-[11px] font-bold text-slate-600 mb-1">Fecha Emisión</label>
+                  <label className="block text-[11px] font-extrabold text-slate-700 mb-1.5">Fecha Emisión</label>
                   <input
                     type="date"
                     value={manualNoteModal.issueDate}
                     onChange={(e) => setManualNoteModal(prev => ({ ...prev, issueDate: e.target.value }))}
-                    className="w-full text-xs font-mono font-bold bg-white border border-slate-200 rounded-lg p-2"
+                    className="w-full text-xs font-mono font-bold bg-white border border-slate-200 rounded-xl p-2.5 outline-none focus:ring-4 focus:ring-purple-500/15 focus:border-purple-400 transition-all text-slate-800"
                   />
                 </div>
               </div>
             </div>
 
             {/* Footer */}
-            <div className="p-4 bg-slate-50 border-t border-slate-200 flex justify-end gap-2.5">
+            <div className="p-4 bg-slate-50/80 border-t border-slate-200/80 flex justify-end gap-2.5">
               <button
                 type="button"
                 onClick={() => setManualNoteModal(prev => ({ ...prev, isOpen: false, doc: null }))}
                 disabled={manualNoteModal.loading}
-                className="px-4 py-2 text-xs font-bold text-slate-600 hover:text-slate-800 transition"
+                className="px-4 py-2 text-xs font-bold text-slate-600 hover:text-slate-800 hover:bg-slate-100 rounded-xl transition"
               >
                 Cancelar
               </button>
               <button
                 type="button"
                 onClick={handleConfirmManualNote}
-                disabled={manualNoteModal.loading}
-                className="px-5 py-2.5 text-xs font-bold text-white bg-purple-600 hover:bg-purple-700 shadow-md shadow-purple-600/20 rounded-xl transition disabled:opacity-50 flex items-center gap-1.5"
+                disabled={
+                  manualNoteModal.loading ||
+                  (manualNoteModal.noteType === '07' && manualNoteModal.remainingBalance <= 0.009) ||
+                  (manualNoteModal.noteType === '08' && manualNoteModal.remainingBalance <= 0.009)
+                }
+                className="px-5 py-2.5 text-xs font-black text-white bg-gradient-to-r from-purple-600 via-indigo-600 to-purple-700 hover:from-purple-700 hover:to-indigo-700 shadow-lg shadow-purple-600/30 rounded-xl transition-all active:scale-95 disabled:opacity-50 flex items-center gap-2 cursor-pointer"
               >
+                <FileSpreadsheet className="w-3.5 h-3.5" />
                 {manualNoteModal.loading ? 'Emitiendo en SUNAT...' : 'Emitir Nota Oficial'}
               </button>
             </div>
@@ -5765,13 +6797,12 @@ Idempotency-Key: cco_order_987654 (Opcional pero recomendado para cero duplicado
       {/* NOTIFICACIÓN / ALERTA VISUAL ELEGANTE (SIN ALERT DE NAVEGADOR) */}
       {feedbackAlert && (
         <div className="fixed bottom-6 right-6 z-50 animate-in slide-in-from-bottom duration-300 max-w-md">
-          <div className={`p-4 rounded-2xl shadow-2xl border flex items-start gap-3 ${
-            feedbackAlert.type === 'success'
+          <div className={`p-4 rounded-2xl shadow-2xl border flex items-start gap-3 ${feedbackAlert.type === 'success'
               ? 'bg-slate-900 text-white border-emerald-500/50'
               : feedbackAlert.type === 'error'
-              ? 'bg-slate-900 text-white border-red-500/50'
-              : 'bg-slate-900 text-white border-indigo-500/50'
-          }`}>
+                ? 'bg-slate-900 text-white border-red-500/50'
+                : 'bg-slate-900 text-white border-indigo-500/50'
+            }`}>
             <div className="mt-0.5 shrink-0">
               {feedbackAlert.type === 'success' ? (
                 <div className="w-6 h-6 rounded-lg bg-emerald-500/20 text-emerald-400 flex items-center justify-center">
