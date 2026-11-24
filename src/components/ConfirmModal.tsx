@@ -40,12 +40,25 @@ export const ConfirmModal: React.FC<ConfirmModalProps> = ({
   onCancel,
 }) => {
   const [isChecked, setIsChecked] = React.useState(false);
+  const [isSubmitting, setIsSubmitting] = React.useState(false);
 
   React.useEffect(() => {
     if (isOpen) {
       setIsChecked(false);
+      setIsSubmitting(false);
     }
   }, [isOpen]);
+
+  const handleConfirmClick = () => {
+    if (isSubmitting || loading) return;
+    setIsSubmitting(true);
+    try {
+      onConfirm();
+    } catch (e) {
+      setIsSubmitting(false);
+      throw e;
+    }
+  };
 
   if (!isOpen) return null;
 
@@ -173,11 +186,11 @@ export const ConfirmModal: React.FC<ConfirmModalProps> = ({
           </button>
           <button
             type="button"
-            onClick={onConfirm}
-            disabled={!canConfirm || loading}
+            onClick={handleConfirmClick}
+            disabled={!canConfirm || loading || isSubmitting}
             className={`px-5 py-2 text-xs font-bold rounded-xl transition-all flex items-center gap-2 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed ${styles.confirmBtn}`}
           >
-            {loading ? (
+            {loading || isSubmitting ? (
               <>
                 <span className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
                 <span>Procesando...</span>

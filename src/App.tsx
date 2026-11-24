@@ -164,6 +164,7 @@ export function App() {
   // 4. Documentos y Colas
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
   const [loading, setLoading] = useState(false);
+  const isEmittingRef = React.useRef(false);
   const [copiedKey, setCopiedKey] = useState(false);
   const [queueStats, setQueueStats] = useState<any>({ counts: [], recentJobs: [] });
 
@@ -284,40 +285,6 @@ export function App() {
     const start = (docPage - 1) * docPageSize;
     return groupedDocTree.slice(start, start + docPageSize);
   }, [groupedDocTree, docPage, docPageSize]);
-
-  // Métricas financieras y de cumplimiento tributario para los KPI ejecutivos
-  const docMetrics = useMemo(() => {
-    const safeDocs = Array.isArray(documents) ? documents.filter(Boolean) : [];
-    const totalCount = safeDocs.length;
-    let totalPEN = 0;
-    let totalUSD = 0;
-    let notesCount = 0;
-    let acceptedCount = 0;
-
-    safeDocs.forEach((d) => {
-      const amt = Number(d.total_amount) || 0;
-      if (d.document_type === '07' || d.document_type === '08') {
-        notesCount++;
-      } else {
-        if (d.currency === 'USD') totalUSD += amt;
-        else totalPEN += amt;
-      }
-      if ((d.status || '').includes('ACCEPTED')) {
-        acceptedCount++;
-      }
-    });
-
-    const complianceRate = totalCount > 0 ? Math.round((acceptedCount / totalCount) * 100) : 100;
-
-    return {
-      totalCount,
-      totalPEN,
-      totalUSD,
-      notesCount,
-      acceptedCount,
-      complianceRate,
-    };
-  }, [documents]);
 
   useEffect(() => {
     setDocPage(1);
@@ -1512,11 +1479,18 @@ export function App() {
     setItems(updated);
   };
 
-  // Ejecución atómica de la emisión
+  // Ejecución atómica de la emisión protegida contra multi-clic
   const executeEmission = async (payload: any) => {
-    if (!currentCompany) return;
+    if (!currentCompany || isEmittingRef.current) return;
+    isEmittingRef.current = true;
     setLoading(true);
+    setConfirmConfig(prev => ({ ...prev, loading: true }));
     try {
+      // Asegurar clave de idempotencia única para garantizar que dos solicitudes nunca dupliquen
+      if (!payload.idempotency_key) {
+        payload.idempotency_key = `cco_${currentCompany.id.substring(0, 8)}_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+      }
+
       const res = await fetch(`${API_BASE}/documents`, {
         method: 'POST',
         headers: {
@@ -1532,17 +1506,38 @@ export function App() {
       }
 
       const created = await res.json();
+
+      // Limpieza exhaustiva del formulario para imposibilitar envíos duplicados posteriores
+      setClientDocNumber('');
+      setClientName('');
+      setClientAddress('');
+      setClientEmail('');
+      setClientSunatStatus(null);
+      setIdempotencyKey('');
+      setItems([
+        {
+          code: '',
+          description: '',
+          unit_measure: 'NIU',
+          quantity: 1,
+          unit_price: 0,
+          igv_affectation_type: '20'
+        }
+      ]);
+
+      // REDIRECCIÓN INMEDIATA A LA BANDEJA DE COMPROBANTES EMITIDOS
+      setActiveTab('documentos');
+
       await fetchDocuments();
       await fetchQueueStats();
       await fetchCompanySeries();
-      setIdempotencyKey('');
 
       setFeedbackAlert({
         type: 'success',
-        message: `Comprobante ${created.full_number || 'emitido'} procesado y transmitido con éxito.`
+        message: `Comprobante ${created.full_number || 'emitido'} procesado y transmitido con éxito. Redirigido al listado de comprobantes.`
       });
 
-      // Abrir vista previa del comprobante recién emitido
+      // Abrir vista previa del comprobante recién emitido sobre la pestaña de documentos
       openPreview(created);
     } catch (err: any) {
       setFeedbackAlert({
@@ -1551,12 +1546,15 @@ export function App() {
       });
     } finally {
       setLoading(false);
+      isEmittingRef.current = false;
+      setConfirmConfig(prev => ({ ...prev, isOpen: false, loading: false }));
     }
   };
 
   // Emisión oficial de Comprobantes a SUNAT con validación estricta y modal de confirmación
   const handleSubmitEmission = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (loading || isEmittingRef.current) return;
     if (!currentCompany) {
       setFeedbackAlert({
         type: 'error',
@@ -1812,7 +1810,8 @@ export function App() {
       confirmText: 'Confirmar y Transmitir',
       cancelText: 'Cancelar y Modificar',
       onConfirm: async () => {
-        setConfirmConfig(prev => ({ ...prev, isOpen: false }));
+        if (isEmittingRef.current) return;
+        setConfirmConfig(prev => ({ ...prev, loading: true }));
         await executeEmission(payload);
       }
     });
@@ -2196,6 +2195,8 @@ export function App() {
       }
     }
 
+    if (manualNoteModal.loading || isEmittingRef.current) return;
+    isEmittingRef.current = true;
     setManualNoteModal(prev => ({ ...prev, loading: true }));
 
     try {
@@ -2225,6 +2226,7 @@ export function App() {
       });
 
       setManualNoteModal(prev => ({ ...prev, isOpen: false, doc: null, loading: false }));
+      setActiveTab('documentos');
       await fetchDocuments();
       await fetchQueueStats();
     } catch (err: any) {
@@ -2233,6 +2235,8 @@ export function App() {
         message: `ERROR: ${err.message}`,
       });
       setManualNoteModal(prev => ({ ...prev, loading: false }));
+    } finally {
+      isEmittingRef.current = false;
     }
   };
 
@@ -2523,11 +2527,10 @@ export function App() {
                 type="button"
                 onClick={() => handleSwitchEnv(currentCompany.env_mode === 'PRODUCCION' ? 'BETA' : 'PRODUCCION')}
                 title="Haz clic para conmutar entre PRODUCCIÓN (fact_live_) y BETA (fact_test_)"
-                className={`text-[10px] font-extrabold px-2.5 py-1 rounded-lg border flex items-center gap-1.5 transition cursor-pointer shadow-xs ${
-                  currentCompany.env_mode === 'PRODUCCION'
-                    ? 'bg-rose-50 text-rose-700 border-rose-300 hover:bg-rose-100'
-                    : 'bg-amber-50 text-amber-800 border-amber-300 hover:bg-amber-100'
-                }`}
+                className={`text-[10px] font-extrabold px-2.5 py-1 rounded-lg border flex items-center gap-1.5 transition cursor-pointer shadow-xs ${currentCompany.env_mode === 'PRODUCCION'
+                  ? 'bg-rose-50 text-rose-700 border-rose-300 hover:bg-rose-100'
+                  : 'bg-amber-50 text-amber-800 border-amber-300 hover:bg-amber-100'
+                  }`}
               >
                 <span className={`w-1.5 h-1.5 rounded-full ${currentCompany.env_mode === 'PRODUCCION' ? 'bg-rose-600 animate-pulse' : 'bg-amber-500'}`} />
                 <span>{currentCompany.env_mode === 'PRODUCCION' ? 'PRODUCCIÓN' : 'BETA'}</span>
@@ -2601,8 +2604,8 @@ export function App() {
         <button
           onClick={() => setActiveTab('dashboard')}
           className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${activeTab === 'dashboard'
-              ? 'border-indigo-600 text-indigo-600 bg-indigo-50/40'
-              : 'border-transparent text-slate-600 hover:text-slate-900'
+            ? 'border-indigo-600 text-indigo-600 bg-indigo-50/40'
+            : 'border-transparent text-slate-600 hover:text-slate-900'
             }`}
         >
           <TrendingUp className="w-4 h-4" /> Panel General
@@ -2610,8 +2613,8 @@ export function App() {
         <button
           onClick={() => setActiveTab('emitir')}
           className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${activeTab === 'emitir'
-              ? 'border-indigo-600 text-indigo-600 bg-indigo-50/40'
-              : 'border-transparent text-slate-600 hover:text-slate-900'
+            ? 'border-indigo-600 text-indigo-600 bg-indigo-50/40'
+            : 'border-transparent text-slate-600 hover:text-slate-900'
             }`}
         >
           <Send className="w-4 h-4" /> Emisión Universal (POS)
@@ -2619,8 +2622,8 @@ export function App() {
         <button
           onClick={() => { setActiveTab('documentos'); fetchDocuments(); }}
           className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${activeTab === 'documentos'
-              ? 'border-indigo-600 text-indigo-600 bg-indigo-50/40'
-              : 'border-transparent text-slate-600 hover:text-slate-900'
+            ? 'border-indigo-600 text-indigo-600 bg-indigo-50/40'
+            : 'border-transparent text-slate-600 hover:text-slate-900'
             }`}
         >
           <FileText className="w-4 h-4" /> Comprobantes ({documents.length})
@@ -2628,8 +2631,8 @@ export function App() {
         <button
           onClick={() => { setActiveTab('guias'); fetchDocuments(); }}
           className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${activeTab === 'guias'
-              ? 'border-indigo-600 text-indigo-600 bg-indigo-50/40'
-              : 'border-transparent text-slate-600 hover:text-slate-900'
+            ? 'border-indigo-600 text-indigo-600 bg-indigo-50/40'
+            : 'border-transparent text-slate-600 hover:text-slate-900'
             }`}
         >
           <Truck className="w-4 h-4 text-indigo-600" /> Guías de Remisión ({documents.filter(d => d.document_type === '09').length})
@@ -2637,8 +2640,8 @@ export function App() {
         <button
           onClick={() => { setActiveTab('empresas'); fetchCompanies(); }}
           className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${activeTab === 'empresas'
-              ? 'border-indigo-600 text-indigo-600 bg-indigo-50/40'
-              : 'border-transparent text-slate-600 hover:text-slate-900'
+            ? 'border-indigo-600 text-indigo-600 bg-indigo-50/40'
+            : 'border-transparent text-slate-600 hover:text-slate-900'
             }`}
         >
           <Building2 className="w-4 h-4" /> Empresas & Negocios ({companies.length})
@@ -2646,8 +2649,8 @@ export function App() {
         <button
           onClick={() => setActiveTab('usuarios')}
           className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${activeTab === 'usuarios'
-              ? 'border-indigo-600 text-indigo-600 bg-indigo-50/40'
-              : 'border-transparent text-slate-600 hover:text-slate-900'
+            ? 'border-indigo-600 text-indigo-600 bg-indigo-50/40'
+            : 'border-transparent text-slate-600 hover:text-slate-900'
             }`}
         >
           <Users className="w-4 h-4" /> Usuarios & Accesos
@@ -2655,8 +2658,8 @@ export function App() {
         <button
           onClick={() => { setActiveTab('colas'); fetchQueueStats(); }}
           className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${activeTab === 'colas'
-              ? 'border-indigo-600 text-indigo-600 bg-indigo-50/40'
-              : 'border-transparent text-slate-600 hover:text-slate-900'
+            ? 'border-indigo-600 text-indigo-600 bg-indigo-50/40'
+            : 'border-transparent text-slate-600 hover:text-slate-900'
             }`}
         >
           <Clock className="w-4 h-4" /> Colas Transaccionales
@@ -2669,8 +2672,8 @@ export function App() {
         <button
           onClick={() => setActiveTab('api')}
           className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${activeTab === 'api'
-              ? 'border-indigo-600 text-indigo-600 bg-indigo-50/40'
-              : 'border-transparent text-slate-600 hover:text-slate-900'
+            ? 'border-indigo-600 text-indigo-600 bg-indigo-50/40'
+            : 'border-transparent text-slate-600 hover:text-slate-900'
             }`}
         >
           <Code2 className="w-4 h-4" /> Documentación API & SDKs
@@ -2678,8 +2681,8 @@ export function App() {
         <button
           onClick={() => setActiveTab('consola')}
           className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${activeTab === 'consola'
-              ? 'border-indigo-600 text-indigo-600 bg-indigo-50/40'
-              : 'border-transparent text-slate-600 hover:text-slate-900'
+            ? 'border-indigo-600 text-indigo-600 bg-indigo-50/40'
+            : 'border-transparent text-slate-600 hover:text-slate-900'
             }`}
         >
           <ShieldCheck className="w-4 h-4" /> Sandbox CCOFACT
@@ -2687,8 +2690,8 @@ export function App() {
         <button
           onClick={() => setActiveTab('guia_sunat')}
           className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${activeTab === 'guia_sunat'
-              ? 'border-amber-600 text-amber-600 bg-amber-50/40'
-              : 'border-transparent text-slate-600 hover:text-slate-900'
+            ? 'border-amber-600 text-amber-600 bg-amber-50/40'
+            : 'border-transparent text-slate-600 hover:text-slate-900'
             }`}
         >
           <Award className="w-4 h-4 text-amber-500" /> Guía SUNAT (Beta & Prod)
@@ -2923,10 +2926,10 @@ export function App() {
                           </td>
                           <td className="py-3 px-3 text-center">
                             <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${(doc.status || '').includes('ACCEPTED')
-                                ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
-                                : doc.status === 'QUEUED'
-                                  ? 'bg-amber-50 text-amber-700 border border-amber-200'
-                                  : 'bg-rose-50 text-rose-700 border border-rose-200'
+                              ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                              : doc.status === 'QUEUED'
+                                ? 'bg-amber-50 text-amber-700 border border-amber-200'
+                                : 'bg-rose-50 text-rose-700 border border-rose-200'
                               }`}>
                               {doc.status}
                             </span>
@@ -3144,8 +3147,8 @@ export function App() {
 
                   {/* ASISTENTE TRIBUTARIO Y MONITOR DE REGLAS SUNAT EN VIVO */}
                   <div className={`p-4 rounded-2xl border transition ${!diagnostics.isValid
-                      ? 'bg-rose-50/70 border-rose-200 text-rose-900'
-                      : 'bg-emerald-50/70 border-emerald-200 text-emerald-900'
+                    ? 'bg-rose-50/70 border-rose-200 text-rose-900'
+                    : 'bg-emerald-50/70 border-emerald-200 text-emerald-900'
                     }`}>
                     <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-2.5 border-b border-black/5">
                       <div className="flex items-center gap-2">
@@ -3161,8 +3164,8 @@ export function App() {
                         </span>
                       </div>
                       <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${!diagnostics.isValid
-                          ? 'bg-rose-200 text-rose-800'
-                          : 'bg-emerald-200 text-emerald-800'
+                        ? 'bg-rose-200 text-rose-800'
+                        : 'bg-emerald-200 text-emerald-800'
                         }`}>
                         {currentCompany?.env_mode === 'PRODUCCION' ? 'Validez Legal SIRE' : 'Homologación Beta'}
                       </span>
@@ -3261,8 +3264,8 @@ export function App() {
                               type="button"
                               onClick={() => handleRefDocTypeChange('03')}
                               className={`py-2 px-2 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer ${refDocType === '03'
-                                  ? 'bg-white text-indigo-700 shadow-sm border border-indigo-200'
-                                  : 'text-slate-600 hover:text-slate-900'
+                                ? 'bg-white text-indigo-700 shadow-sm border border-indigo-200'
+                                : 'text-slate-600 hover:text-slate-900'
                                 }`}
                             >
                               <FileText className="w-3.5 h-3.5" />
@@ -3272,8 +3275,8 @@ export function App() {
                               type="button"
                               onClick={() => handleRefDocTypeChange('01')}
                               className={`py-2 px-2 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer ${refDocType === '01'
-                                  ? 'bg-white text-indigo-700 shadow-sm border border-indigo-200'
-                                  : 'text-slate-600 hover:text-slate-900'
+                                ? 'bg-white text-indigo-700 shadow-sm border border-indigo-200'
+                                : 'text-slate-600 hover:text-slate-900'
                                 }`}
                             >
                               <Building2 className="w-3.5 h-3.5" />
@@ -3388,25 +3391,24 @@ export function App() {
                               </div>
                             </div>
                           ) : sunatConsultResult.official_status === 'ACEPTADO' ? (
-                            <div className="bg-gradient-to-b from-emerald-50/60 via-white to-white border-2 border-emerald-400 rounded-3xl p-5 shadow-lg shadow-emerald-500/10 space-y-4 ring-1 ring-emerald-500/20">
-                              {/* Header del Certificado de Consulta Oficial */}
-                              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-emerald-100 pb-3.5">
-                                <div className="flex items-center gap-3.5">
-                                  <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-emerald-500 to-teal-600 text-white shadow-md shadow-emerald-500/25 flex items-center justify-center font-black text-sm shrink-0 ring-4 ring-emerald-100">
-                                    <ShieldCheck className="w-6 h-6" />
+                            <div className="bg-white border-2 border-emerald-500/80 rounded-2xl p-4 shadow-sm space-y-3.5">
+                              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-emerald-100 pb-3">
+                                <div className="flex items-center gap-3">
+                                  <div className="w-11 h-11 rounded-xl bg-emerald-50 text-emerald-800 border-2 border-emerald-300 flex items-center justify-center font-black text-xs shrink-0 shadow-xs">
+                                    {refDocType === '01' ? 'FAC' : 'BOL'}
                                   </div>
                                   <div>
-                                    <div className="flex items-center gap-2 flex-wrap">
-                                      <span className="font-mono font-black text-slate-900 text-base tracking-tight">
+                                    <div className="flex items-center gap-2">
+                                      <span className="font-black text-slate-900 text-sm tracking-tight">
                                         {sunatConsultResult.full_number}
                                       </span>
-                                      <span className="inline-flex items-center gap-1.5 text-[10px] bg-emerald-100 text-emerald-800 font-black px-2.5 py-0.5 rounded-full border border-emerald-300 shadow-2xs">
-                                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                                      <span className="text-[10px] bg-emerald-100 text-emerald-800 font-extrabold px-2.5 py-0.5 rounded-full border border-emerald-300 flex items-center gap-1">
+                                        <CheckCircle2 className="w-3 h-3 text-emerald-600" />
                                         SUNAT CDR: CÓDIGO {sunatConsultResult.sunat_response_code || '0'} (ACEPTADO)
                                       </span>
                                     </div>
-                                    <p className="text-xs text-slate-600 font-medium mt-0.5">
-                                      {sunatConsultResult.sunat_description || 'El comprobante ha sido validado y aceptado oficialmente por SUNAT.'}
+                                    <p className="text-xs text-slate-600 font-medium">
+                                      {sunatConsultResult.sunat_description || 'El comprobante ha sido aceptado por SUNAT.'}
                                     </p>
                                   </div>
                                 </div>
@@ -3420,7 +3422,7 @@ export function App() {
                                       title="Visualizar la representación oficial de SUNAT con código QR y constancia de recepción"
                                     >
                                       <Eye className="w-3.5 h-3.5" />
-                                      <span>👁️ Ver Comprobante SUNAT</span>
+                                      <span>👁️ Ver Boleta Oficial SUNAT</span>
                                     </button>
                                   )}
                                   <button
@@ -3438,31 +3440,30 @@ export function App() {
                               </div>
 
                               {/* Ficha de Datos Tributarios Verificados */}
-                              <div className="space-y-3.5">
-                                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs bg-gradient-to-br from-slate-50 to-slate-100/60 p-4 rounded-2xl border border-slate-200/80">
-                                  <div className="space-y-1">
-                                    <span className="text-slate-400 block text-[10px] font-black uppercase tracking-wider">Cliente Adquirente</span>
-                                    <span className="font-mono font-bold text-indigo-700 text-xs bg-indigo-50 px-2 py-0.5 rounded border border-indigo-200/80 inline-block">
+                              <div className="space-y-3">
+                                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs bg-emerald-50/40 p-3.5 rounded-xl border border-emerald-200/60">
+                                  <div>
+                                    <span className="text-slate-500 block text-[10px] font-bold uppercase tracking-wider">Cliente Adquirente</span>
+                                    <span className="font-extrabold text-slate-900 block truncate text-xs">
                                       {(linkedRefDoc?.client_doc_type || sunatConsultResult.recipient?.doc_type) === '6' ? 'RUC' : 'DNI'}{' '}
                                       {linkedRefDoc?.client_doc_number || sunatConsultResult.recipient?.doc_number || '-'}
                                     </span>
-                                    <p className="text-slate-800 font-extrabold text-xs truncate">
+                                    <p className="text-slate-700 truncate font-medium text-[11px]">
                                       {linkedRefDoc?.client_name || sunatConsultResult.recipient?.name || clientName || 'Receptor Verificado'}
                                     </p>
                                   </div>
-                                  <div className="space-y-1 sm:border-x sm:border-slate-200/80 sm:px-3">
-                                    <span className="text-slate-400 block text-[10px] font-black uppercase tracking-wider">Fecha & Emisión</span>
-                                    <span className="font-mono font-bold text-slate-800 text-xs block">
+                                  <div>
+                                    <span className="text-slate-500 block text-[10px] font-bold uppercase tracking-wider">Fecha & Estado SUNAT</span>
+                                    <span className="font-extrabold text-slate-900 block text-xs">
                                       {sunatConsultResult.issue_date || linkedRefDoc?.issue_date || 'Fecha registrada en SUNAT'}
                                     </span>
-                                    <span className="inline-flex items-center gap-1 text-[10px] text-emerald-700 font-black bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
-                                      <CheckCircle2 className="w-3 h-3 text-emerald-600" />
-                                      Constancia CDR Verificada
-                                    </span>
+                                    <p className="text-emerald-700 text-[11px] font-bold flex items-center gap-1">
+                                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 inline" /> CDR Oficial Aceptado
+                                    </p>
                                   </div>
-                                  <div className="text-left sm:text-right flex flex-col justify-center">
-                                    <span className="text-slate-400 text-[10px] font-black uppercase tracking-wider block">Monto Total Oficial</span>
-                                    <span className="text-2xl font-black font-mono text-emerald-700">
+                                  <div className="text-left sm:text-right sm:border-l sm:border-emerald-200/80 sm:pl-3 flex flex-col justify-center">
+                                    <span className="text-slate-500 text-[10px] font-bold uppercase tracking-wider">Monto Total Declarado</span>
+                                    <span className="text-xl font-black font-mono text-emerald-700">
                                       S/ {Number(sunatConsultResult.total_amount || linkedRefDoc?.total_amount || 0).toFixed(2)}
                                     </span>
                                   </div>
@@ -3478,51 +3479,51 @@ export function App() {
 
                                   if (displayItems.length === 0) {
                                     return (
-                                      <div className="p-3 bg-emerald-50/70 border border-emerald-300 rounded-2xl text-xs text-emerald-900 flex items-center justify-between font-medium">
+                                      <div className="p-2.5 bg-emerald-50/70 border border-emerald-300 rounded-xl text-[11px] text-emerald-900 flex items-center justify-between">
                                         <span>
-                                          ✓ Comprobante <b>{sunatConsultResult.full_number}</b> validado en servidores de SUNAT por un total de <b>S/ {Number(sunatConsultResult.total_amount || linkedRefDoc?.total_amount || 0).toFixed(2)}</b>.
+                                          ✓ Comprobante <b>{sunatConsultResult.full_number}</b> verificado en servidores de SUNAT por un total de <b>S/ {Number(sunatConsultResult.total_amount || linkedRefDoc?.total_amount || 0).toFixed(2)}</b>.
                                         </span>
-                                        <span className="font-extrabold text-emerald-800 bg-emerald-100 px-2.5 py-1 rounded-xl border border-emerald-300">
-                                          Listo para Emitir Nota
+                                        <span className="font-bold text-emerald-800">
+                                          Listo para emitir Nota
                                         </span>
                                       </div>
                                     );
                                   }
 
                                   return (
-                                    <div className="bg-white rounded-2xl border border-slate-200/90 overflow-hidden shadow-xs">
-                                      <div className="bg-slate-50/80 px-4 py-2.5 border-b border-slate-200/80 flex items-center justify-between">
-                                        <span className="font-extrabold text-[11px] text-slate-800 uppercase tracking-wider flex items-center gap-1.5">
-                                          📦 Bienes / Productos Emitidos en {sunatConsultResult.full_number}
+                                    <div className="bg-white rounded-xl border border-emerald-200 overflow-hidden shadow-2xs">
+                                      <div className="bg-emerald-50/80 px-3 py-2 border-b border-emerald-200 flex items-center justify-between">
+                                        <span className="font-bold text-[11px] text-emerald-950 uppercase tracking-wide flex items-center gap-1.5">
+                                          📦 Bienes / Productos Vendidos en este Comprobante ({sunatConsultResult.full_number})
                                         </span>
-                                        <span className="text-[10px] font-black text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200">
-                                          ✓ Precargados para Ajuste
+                                        <span className="text-[10px] font-bold text-emerald-800 bg-emerald-100 px-2 py-0.5 rounded-full border border-emerald-300">
+                                          ✓ Precargados en la Nota
                                         </span>
                                       </div>
                                       <div className="overflow-x-auto">
                                         <table className="w-full text-left text-xs">
-                                          <thead className="bg-slate-50/50 text-[10px] font-extrabold text-slate-400 uppercase tracking-wider border-b border-slate-100">
+                                          <thead className="bg-slate-50 text-[10px] font-bold text-slate-600 uppercase border-b border-slate-100">
                                             <tr>
-                                              <th className="px-4 py-2">Descripción del Ítem</th>
-                                              <th className="px-4 py-2 text-center">Cant.</th>
-                                              <th className="px-4 py-2 text-right">Precio Unit.</th>
-                                              <th className="px-4 py-2 text-right">Importe Total</th>
+                                              <th className="px-3 py-1.5">Bien / Producto Vendido</th>
+                                              <th className="px-3 py-1.5 text-center">Cant.</th>
+                                              <th className="px-3 py-1.5 text-right">Precio Unit.</th>
+                                              <th className="px-3 py-1.5 text-right">Total</th>
                                             </tr>
                                           </thead>
                                           <tbody className="divide-y divide-slate-100">
                                             {displayItems.map((it: any, idx: number) => (
-                                              <tr key={idx} className="hover:bg-slate-50/60 transition">
-                                                <td className="px-4 py-2.5 font-bold text-slate-800">{it.description || it.name || 'Producto'}</td>
-                                                <td className="px-4 py-2.5 text-center font-mono font-bold text-slate-700">{it.quantity || 1}</td>
-                                                <td className="px-4 py-2.5 text-right font-mono text-slate-600">S/ {Number(it.unit_price || it.price || 0).toFixed(2)}</td>
-                                                <td className="px-4 py-2.5 text-right font-mono font-black text-emerald-700">S/ {Number(it.total || (Number(it.quantity || 1) * Number(it.unit_price || it.price || 0))).toFixed(2)}</td>
+                                              <tr key={idx} className="hover:bg-slate-50/50">
+                                                <td className="px-3 py-2 font-bold text-slate-800">{it.description || it.name || 'Producto'}</td>
+                                                <td className="px-3 py-2 text-center font-mono font-semibold text-slate-700">{it.quantity || 1}</td>
+                                                <td className="px-3 py-2 text-right font-mono text-slate-700">S/ {Number(it.unit_price || it.price || 0).toFixed(2)}</td>
+                                                <td className="px-3 py-2 text-right font-mono font-bold text-emerald-700">S/ {Number(it.total || (Number(it.quantity || 1) * Number(it.unit_price || it.price || 0))).toFixed(2)}</td>
                                               </tr>
                                             ))}
                                           </tbody>
-                                          <tfoot className="bg-slate-50/80 border-t border-slate-200 font-bold text-xs">
+                                          <tfoot className="bg-emerald-50/40 border-t border-emerald-200 font-bold text-xs">
                                             <tr>
-                                              <td colSpan={3} className="px-4 py-2.5 text-right text-slate-700 uppercase font-black text-[11px] tracking-wider">Total Declarado en Comprobante:</td>
-                                              <td className="px-4 py-2.5 text-right font-mono font-black text-emerald-800 text-sm">
+                                              <td colSpan={3} className="px-3 py-2 text-right text-slate-700 uppercase font-black">Total Declarado:</td>
+                                              <td className="px-3 py-2 text-right font-mono font-black text-emerald-800 text-sm">
                                                 S/ {Number(sunatConsultResult.total_amount || linkedRefDoc?.total_amount || 0).toFixed(2)}
                                               </td>
                                             </tr>
@@ -4010,8 +4011,8 @@ export function App() {
                           <label className="font-semibold text-slate-700">Razón Social / Nombre Completo</label>
                           {clientSunatStatus && (
                             <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${clientSunatStatus.estado === 'ACTIVO' && clientSunatStatus.condicion === 'HABIDO'
-                                ? 'bg-emerald-50 text-emerald-700 border-emerald-300'
-                                : 'bg-amber-50 text-amber-700 border-amber-300'
+                              ? 'bg-emerald-50 text-emerald-700 border-emerald-300'
+                              : 'bg-amber-50 text-amber-700 border-amber-300'
                               }`}>
                               SUNAT: {clientSunatStatus.estado} - {clientSunatStatus.condicion}
                             </span>
@@ -4172,10 +4173,10 @@ export function App() {
                                 value={it.igv_affectation_type}
                                 onChange={(e) => handleItemChange(idx, 'igv_affectation_type', e.target.value)}
                                 className={`w-full border rounded-lg px-2 py-1.5 text-xs font-bold outline-none cursor-pointer ${it.igv_affectation_type === '20'
-                                    ? 'bg-emerald-50 text-emerald-800 border-emerald-300'
-                                    : it.igv_affectation_type === '30'
-                                      ? 'bg-purple-50 text-purple-800 border-purple-300'
-                                      : 'bg-slate-50 text-slate-800 border-slate-200'
+                                  ? 'bg-emerald-50 text-emerald-800 border-emerald-300'
+                                  : it.igv_affectation_type === '30'
+                                    ? 'bg-purple-50 text-purple-800 border-purple-300'
+                                    : 'bg-slate-50 text-slate-800 border-slate-200'
                                   }`}
                               >
                                 <option value="10">10 - Gravado (18%)</option>
@@ -4283,7 +4284,7 @@ export function App() {
 
                     <button
                       type="submit"
-                      disabled={loading || !diagnostics.isValid}
+                      disabled={loading || isEmittingRef.current || !diagnostics.isValid}
                       className="flex items-center gap-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold text-sm px-6 py-3.5 rounded-xl shadow-lg shadow-indigo-500/25 transition cursor-pointer"
                     >
                       {loading ? <RotateCw className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
@@ -4297,123 +4298,36 @@ export function App() {
         )}
 
         {/* ================================================================== */}
-        {/* TAB 3: COMPROBANTES EMITIDOS - EXPERIENCIA FINTECH PRO */}
+        {/* TAB 3: COMPROBANTES EMITIDOS */}
         {/* ================================================================== */}
         {activeTab === 'documentos' && (
           <div className="space-y-4">
-            {/* ENCABEZADO Y ACCIONES PRINCIPALES */}
             <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
               <div>
-                <h2 className="text-xl font-black text-slate-900 tracking-tight flex items-center gap-2.5">
-                  <div className="w-8 h-8 rounded-xl bg-indigo-50 border border-indigo-200/80 flex items-center justify-center text-indigo-600 shadow-2xs">
-                    <FileText className="w-4.5 h-4.5" />
-                  </div>
-                  <span>{docViewMode === 'EXPEDIENTES' ? 'Expedientes Tributarios SUNAT' : 'Cronograma Total de Comprobantes'}</span>
-                  <span className="text-xs font-bold px-2 py-0.5 rounded-full bg-slate-100 text-slate-700 border border-slate-200">
-                    {groupedDocTree.length} operaciones
-                  </span>
+                <h2 className="text-xl font-bold text-slate-900 flex items-center gap-2">
+                  <FileText className="w-6 h-6 text-indigo-600" /> {docViewMode === 'EXPEDIENTES' ? 'Expedientes Tributarios SUNAT' : 'Cronograma Total de Comprobantes'} ({groupedDocTree.length})
                 </h2>
-                <p className="text-xs text-slate-500 mt-0.5">Historial UBL 2.1 con trazabilidad de notas, saldos contables y validación oficial CDR</p>
+                <p className="text-xs text-slate-500">Historial completo con CDR oficial, representación impresa y XML firmado</p>
               </div>
 
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={fetchDocuments}
-                  className="flex items-center gap-1.5 bg-white hover:bg-slate-50 text-slate-700 text-xs font-bold px-3.5 py-2 rounded-xl border border-slate-200/80 shadow-2xs transition cursor-pointer active:scale-95"
-                  title="Actualizar listado de comprobantes desde el servidor"
-                >
-                  <RefreshCw className={`w-3.5 h-3.5 text-indigo-600 ${loading ? 'animate-spin' : ''}`} />
-                  <span>Actualizar</span>
-                </button>
-              </div>
+              <button
+                onClick={fetchDocuments}
+                className="flex items-center gap-1.5 bg-white hover:bg-slate-50 text-slate-700 text-xs font-semibold px-3.5 py-2 rounded-xl border border-slate-200 shadow-2xs transition cursor-pointer"
+              >
+                <RefreshCw className="w-3.5 h-3.5 text-indigo-600" /> Actualizar
+              </button>
             </div>
 
-            {/* 4 TARJETAS KPI EJECUTIVAS */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
-              {/* KPI 1: Total Expedientes */}
-              <div className="bg-white border border-slate-200/80 rounded-2xl p-4 shadow-2xs hover:shadow-xs transition relative overflow-hidden group">
-                <div className="flex items-center justify-between mb-2">
-                  <span className="text-xs font-bold text-slate-500 uppercase tracking-wider">Total Registrados</span>
-                  <div className="w-8 h-8 rounded-xl bg-indigo-50 border border-indigo-100 text-indigo-600 flex items-center justify-center group-hover:scale-110 transition-transform">
-                    <FileText className="w-4 h-4" />
-                  </div>
-                </div>
-                <div className="text-2xl font-black font-mono text-slate-900 tracking-tight">
-                  {docMetrics.totalCount}
-                </div>
-                <div className="mt-2 flex items-center gap-1.5 text-[11px] text-slate-500 font-medium">
-                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-indigo-500" />
-                  <span>{groupedDocTree.length} registros en vista</span>
-                </div>
-              </div>
-
-              {/* KPI 2: Facturación Declarada */}
-              <div className="bg-white border border-slate-200/80 rounded-2xl p-4 shadow-2xs hover:shadow-xs transition relative overflow-hidden group">
-                <div className="flex items-center justify-between mb-2">
-                  <span className="text-xs font-bold text-slate-500 uppercase tracking-wider">Ventas Emitidas (PEN)</span>
-                  <div className="w-8 h-8 rounded-xl bg-emerald-50 border border-emerald-100 text-emerald-600 flex items-center justify-center group-hover:scale-110 transition-transform">
-                    <TrendingUp className="w-4 h-4" />
-                  </div>
-                </div>
-                <div className="text-2xl font-black font-mono text-emerald-700 tracking-tight">
-                  S/ {docMetrics.totalPEN.toLocaleString('es-PE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                </div>
-                <div className="mt-2 flex items-center gap-1.5 text-[11px] text-slate-500 font-medium">
-                  {docMetrics.totalUSD > 0 ? (
-                    <span className="font-mono text-emerald-600 font-bold">+ $ {docMetrics.totalUSD.toFixed(2)} USD</span>
-                  ) : (
-                    <span>Base declarada en moneda nacional</span>
-                  )}
-                </div>
-              </div>
-
-              {/* KPI 3: Trazabilidad Notas NC/ND */}
-              <div className="bg-white border border-slate-200/80 rounded-2xl p-4 shadow-2xs hover:shadow-xs transition relative overflow-hidden group">
-                <div className="flex items-center justify-between mb-2">
-                  <span className="text-xs font-bold text-slate-500 uppercase tracking-wider">Notas de Ajuste</span>
-                  <div className="w-8 h-8 rounded-xl bg-purple-50 border border-purple-100 text-purple-600 flex items-center justify-center group-hover:scale-110 transition-transform">
-                    <Receipt className="w-4 h-4" />
-                  </div>
-                </div>
-                <div className="text-2xl font-black font-mono text-purple-700 tracking-tight">
-                  {docMetrics.notesCount}
-                </div>
-                <div className="mt-2 flex items-center gap-1.5 text-[11px] text-slate-500 font-medium">
-                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-purple-500" />
-                  <span>Crédito y Débito sincronizadas</span>
-                </div>
-              </div>
-
-              {/* KPI 4: Conformidad SUNAT */}
-              <div className="bg-white border border-slate-200/80 rounded-2xl p-4 shadow-2xs hover:shadow-xs transition relative overflow-hidden group">
-                <div className="flex items-center justify-between mb-2">
-                  <span className="text-xs font-bold text-slate-500 uppercase tracking-wider">Conformidad SUNAT</span>
-                  <div className="w-8 h-8 rounded-xl bg-blue-50 border border-blue-100 text-blue-600 flex items-center justify-center group-hover:scale-110 transition-transform">
-                    <ShieldCheck className="w-4 h-4" />
-                  </div>
-                </div>
-                <div className="text-2xl font-black font-mono text-blue-700 tracking-tight">
-                  {docMetrics.complianceRate}%
-                </div>
-                <div className="mt-2 flex items-center gap-1.5 text-[11px] text-slate-500 font-medium">
-                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-blue-500" />
-                  <span>{docMetrics.acceptedCount} comprobantes con CDR 0</span>
-                </div>
-              </div>
-            </div>
-
-            {/* SELECTOR DE VISTA PRO: EXPEDIENTES TRIBUTARIOS vs CRONOGRAMA CONTINUO */}
+            {/* SELECTOR DE VISTA PRO: EXPEDIENTES TRIBUTARIOS (CON TRAZABILIDAD) vs CRONOGRAMA CONTINUO */}
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-white border border-slate-200/80 rounded-2xl p-2.5 shadow-2xs">
               <div className="inline-flex p-1 bg-slate-100/90 rounded-xl border border-slate-200">
                 <button
                   type="button"
                   onClick={() => setDocViewMode('EXPEDIENTES')}
-                  className={`inline-flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-bold transition cursor-pointer ${
-                    docViewMode === 'EXPEDIENTES'
-                      ? 'bg-white text-indigo-700 shadow-2xs border border-indigo-100'
-                      : 'text-slate-600 hover:text-slate-900'
-                  }`}
+                  className={`inline-flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-bold transition cursor-pointer ${docViewMode === 'EXPEDIENTES'
+                    ? 'bg-white text-indigo-700 shadow-2xs border border-indigo-100'
+                    : 'text-slate-600 hover:text-slate-900'
+                    }`}
                 >
                   <FileText className="w-4 h-4 text-indigo-600" />
                   <span>Expedientes Tributarios (Con Trazabilidad)</span>
@@ -4424,11 +4338,10 @@ export function App() {
                 <button
                   type="button"
                   onClick={() => setDocViewMode('TODOS')}
-                  className={`inline-flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-bold transition cursor-pointer ${
-                    docViewMode === 'TODOS'
-                      ? 'bg-white text-indigo-700 shadow-2xs border border-indigo-100'
-                      : 'text-slate-600 hover:text-slate-900'
-                  }`}
+                  className={`inline-flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-bold transition cursor-pointer ${docViewMode === 'TODOS'
+                    ? 'bg-white text-indigo-700 shadow-2xs border border-indigo-100'
+                    : 'text-slate-600 hover:text-slate-900'
+                    }`}
                 >
                   <Clock className="w-4 h-4 text-slate-500" />
                   <span>Cronograma Total (Todos los Comprobantes)</span>
@@ -4439,12 +4352,12 @@ export function App() {
                 {docViewMode === 'EXPEDIENTES' ? (
                   <span className="flex items-center gap-1.5 text-indigo-900 font-semibold">
                     <Sparkles className="w-3.5 h-3.5 text-indigo-600" />
-                    Expedientes comerciales agrupados con su trazabilidad de notas vinculadas
+                    Expedientes comerciales (Boletas, Facturas y Guías) con su trazabilidad de notas
                   </span>
                 ) : (
                   <span className="flex items-center gap-1.5 text-slate-700 font-semibold">
                     <Clock className="w-3.5 h-3.5 text-slate-500" />
-                    Registro cronológico completo de emisión (más reciente a más antiguo)
+                    Registro cronológico completo de todos los comprobantes emitidos (más reciente a más antiguo)
                   </span>
                 )}
               </div>
@@ -4452,28 +4365,19 @@ export function App() {
 
             {/* BARRA DE FILTROS CCOFACT PRO */}
             <div className="bg-white border border-slate-200/80 rounded-2xl p-3.5 flex flex-wrap items-center justify-between gap-3 shadow-xs">
-              <div className="relative flex-1 min-w-[240px]">
+              <div className="relative flex-1 min-w-[220px]">
                 <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
                 <input
                   type="text"
-                  placeholder="Buscar por número (ej: B001-27), RUC/DNI o cliente..."
+                  placeholder="Buscar por número, RUC/DNI o cliente..."
                   value={docSearchTerm}
                   onChange={(e) => setDocSearchTerm(e.target.value)}
-                  className="w-full pl-9 pr-8 py-2 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-400 outline-none font-medium transition"
+                  className="w-full pl-9 pr-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:ring-2 focus:ring-indigo-500/20 outline-none font-medium"
                 />
-                {docSearchTerm && (
-                  <button
-                    type="button"
-                    onClick={() => setDocSearchTerm('')}
-                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-0.5 rounded cursor-pointer"
-                  >
-                    <X className="w-3.5 h-3.5" />
-                  </button>
-                )}
               </div>
 
               <div className="flex items-center gap-2 flex-wrap">
-                <div className="flex items-center gap-1.5 bg-slate-50 border border-slate-200 rounded-xl px-2.5 py-1.5 text-xs">
+                <div className="flex items-center gap-1.5 bg-slate-50 border border-slate-200 rounded-xl px-2.5 py-1 text-xs">
                   <span className="text-[10px] font-bold text-slate-400 uppercase">Desde:</span>
                   <input
                     type="date"
@@ -4482,7 +4386,7 @@ export function App() {
                     className="bg-transparent font-medium text-slate-700 outline-none text-xs"
                   />
                 </div>
-                <div className="flex items-center gap-1.5 bg-slate-50 border border-slate-200 rounded-xl px-2.5 py-1.5 text-xs">
+                <div className="flex items-center gap-1.5 bg-slate-50 border border-slate-200 rounded-xl px-2.5 py-1 text-xs">
                   <span className="text-[10px] font-bold text-slate-400 uppercase">Hasta:</span>
                   <input
                     type="date"
@@ -4495,7 +4399,7 @@ export function App() {
                 <select
                   value={docFilterType}
                   onChange={(e) => setDocFilterType(e.target.value)}
-                  className="text-xs bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 font-bold text-slate-700 outline-none cursor-pointer hover:bg-slate-100 transition"
+                  className="text-xs bg-slate-50 border border-slate-200 rounded-xl px-2.5 py-1.5 font-bold text-slate-700 outline-none cursor-pointer"
                 >
                   <option value="ALL">Todos los Tipos</option>
                   <option value="01">Factura (01)</option>
@@ -4508,45 +4412,29 @@ export function App() {
                 <select
                   value={docFilterStatus}
                   onChange={(e) => setDocFilterStatus(e.target.value)}
-                  className="text-xs bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 font-bold text-slate-700 outline-none cursor-pointer hover:bg-slate-100 transition"
+                  className="text-xs bg-slate-50 border border-slate-200 rounded-xl px-2.5 py-1.5 font-bold text-slate-700 outline-none cursor-pointer"
                 >
                   <option value="ALL">Todos los Estados</option>
                   <option value="ACCEPTED">Aceptados (CDR 0)</option>
                   <option value="ANULADO">Anulados (N/C)</option>
                   <option value="REJECTED">Observados / En Cola</option>
                 </select>
-
-                {(docSearchTerm || docFilterStartDate || docFilterEndDate || docFilterType !== 'ALL' || docFilterStatus !== 'ALL') && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setDocSearchTerm('');
-                      setDocFilterStartDate('');
-                      setDocFilterEndDate('');
-                      setDocFilterType('ALL');
-                      setDocFilterStatus('ALL');
-                    }}
-                    className="text-xs font-bold text-rose-600 hover:text-rose-800 bg-rose-50 hover:bg-rose-100 border border-rose-200 px-2.5 py-1.5 rounded-xl transition cursor-pointer"
-                  >
-                    Limpiar
-                  </button>
-                )}
               </div>
             </div>
 
-            {/* TABLA PRINCIPAL DE COMPROBANTES CON DISEÑO PRO */}
             <div className="bg-white border border-slate-200/80 rounded-3xl overflow-hidden shadow-xs">
               <div className="overflow-x-auto">
                 <table className="w-full text-left text-xs">
                   <thead>
-                    <tr className="border-b border-slate-200/80 text-slate-500 bg-slate-50/90 font-bold uppercase tracking-wider text-[11px]">
-                      <th className="py-3.5 px-4">Comprobante</th>
-                      <th className="py-3.5 px-4">Cliente / Receptor</th>
-                      <th className="py-3.5 px-4">Fecha / Hora</th>
-                      <th className="py-3.5 px-4 text-right">Total / Saldo</th>
-                      <th className="py-3.5 px-4 text-center">Estado Comercial</th>
-                      <th className="py-3.5 px-4 text-center">Estado SUNAT</th>
-                      <th className="py-3.5 px-4 text-right">Acciones</th>
+                    <tr className="border-b border-slate-200 text-slate-500 bg-slate-50/80 font-bold">
+                      <th className="py-3 px-4">Comprobante</th>
+                      <th className="py-3 px-4">Tipo</th>
+                      <th className="py-3 px-4">Cliente / Receptor</th>
+                      <th className="py-3 px-4">Fecha / Hora</th>
+                      <th className="py-3 px-4 text-right">Total / Saldo</th>
+                      <th className="py-3 px-4 text-center">Estado Comercial</th>
+                      <th className="py-3 px-4 text-center">Estado SUNAT</th>
+                      <th className="py-3 px-4 text-right">Acciones</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
@@ -4555,127 +4443,65 @@ export function App() {
                       const commStatus = getCommercialMovementStatus(doc, notes);
                       const isExpanded = !!expandedDocIds[doc.id];
 
-                      // Clases e ícono según tipo de comprobante
-                      let docTypeBadgeClass = 'bg-teal-50 text-teal-800 border-teal-200';
-                      let docTypeLabel = 'Guía Remisión';
-                      let DocIcon = Truck;
-
-                      if (doc.document_type === '01') {
-                        docTypeBadgeClass = 'bg-blue-50 text-blue-800 border-blue-200';
-                        docTypeLabel = 'Factura';
-                        DocIcon = Building2;
-                      } else if (doc.document_type === '03') {
-                        docTypeBadgeClass = 'bg-emerald-50 text-emerald-800 border-emerald-200';
-                        docTypeLabel = 'Boleta';
-                        DocIcon = FileText;
-                      } else if (doc.document_type === '07') {
-                        docTypeBadgeClass = 'bg-rose-50 text-rose-800 border-rose-200';
-                        docTypeLabel = 'Nota Crédito';
-                        DocIcon = Receipt;
-                      } else if (doc.document_type === '08') {
-                        docTypeBadgeClass = 'bg-purple-50 text-purple-800 border-purple-200';
-                        docTypeLabel = 'Nota Débito';
-                        DocIcon = Receipt;
-                      }
-
-                      const clientInitial = (doc.client_name || 'C').charAt(0).toUpperCase();
-
                       return (
                         <React.Fragment key={doc.id}>
-                          <tr className={`hover:bg-slate-50/80 transition ${isExpanded ? 'bg-indigo-50/25' : ''}`}>
-                            {/* COLUMNA 1: COMPROBANTE Y TIPO */}
-                            <td className="py-3.5 px-4">
-                              <div className="flex items-center gap-2.5">
-                                <div className={`w-8 h-8 rounded-xl flex items-center justify-center border shadow-2xs shrink-0 ${docTypeBadgeClass}`}>
-                                  <DocIcon className="w-4 h-4" />
-                                </div>
-                                <div className="space-y-0.5">
-                                  <div className="flex items-center gap-1.5 flex-wrap">
-                                    <span className="font-mono font-black text-slate-900 text-sm tracking-tight">
-                                      {doc.full_number}
-                                    </span>
-                                    <span className={`text-[9px] font-extrabold uppercase px-1.5 py-0.2 rounded border ${docTypeBadgeClass}`}>
-                                      {docTypeLabel}
-                                    </span>
-                                  </div>
-
-                                  {notes.length > 0 && (
-                                    <div>
-                                      <button
-                                        type="button"
-                                        onClick={() => setExpandedDocIds(prev => ({ ...prev, [doc.id]: !prev[doc.id] }))}
-                                        className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold transition shadow-2xs cursor-pointer border ${
-                                          isExpanded
-                                            ? 'bg-indigo-600 text-white border-indigo-700'
-                                            : 'bg-indigo-50 text-indigo-700 border-indigo-200 hover:bg-indigo-100'
-                                        }`}
-                                        title="Ver panel ejecutivo de modificaciones, trazabilidad contable e ítems afectados"
-                                      >
-                                        <Receipt className="w-3 h-3" />
-                                        <span>{notes.length} Ajuste(s)</span>
-                                        <ChevronDown className={`w-3 h-3 transition-transform ${isExpanded ? 'rotate-180' : ''}`} />
-                                      </button>
-                                    </div>
-                                  )}
-                                </div>
+                          <tr className={`hover:bg-slate-50/80 transition ${isExpanded ? 'bg-indigo-50/20' : ''}`}>
+                            <td className="py-3 px-4 font-mono font-bold text-indigo-600">
+                              <div className="flex items-center gap-1.5 flex-wrap">
+                                <span>{doc.full_number}</span>
+                                {notes.length > 0 && (
+                                  <button
+                                    type="button"
+                                    onClick={() => setExpandedDocIds(prev => ({ ...prev, [doc.id]: !prev[doc.id] }))}
+                                    className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold transition shadow-2xs cursor-pointer border ${isExpanded
+                                      ? 'bg-indigo-600 text-white border-indigo-700'
+                                      : 'bg-indigo-50 text-indigo-700 border-indigo-200 hover:bg-indigo-100'
+                                      }`}
+                                    title="Ver panel ejecutivo de modificaciones, trazabilidad contable e ítems afectados"
+                                  >
+                                    <Receipt className="w-3 h-3" />
+                                    <span>{notes.length} Ajuste(s)</span>
+                                    <ChevronDown className={`w-3 h-3 transition-transform ${isExpanded ? 'rotate-180' : ''}`} />
+                                  </button>
+                                )}
                               </div>
                             </td>
-
-                            {/* COLUMNA 2: CLIENTE / RECEPTOR */}
-                            <td className="py-3.5 px-4">
-                              <div className="flex items-start gap-2.5 max-w-[260px]">
-                                <div className="w-7 h-7 rounded-lg bg-slate-100 border border-slate-200/80 font-bold text-slate-600 flex items-center justify-center text-xs shrink-0 mt-0.5">
-                                  {clientInitial}
-                                </div>
-                                <div className="min-w-0">
-                                  <div className="font-bold text-slate-900 truncate" title={doc.client_name}>
-                                    {doc.client_name || 'CONSUMIDOR FINAL'}
-                                  </div>
-                                  <div className="text-[10px] text-slate-500 font-mono flex items-center gap-1.5 flex-wrap mt-0.5">
-                                    <span className="bg-slate-100 px-1.5 py-0.2 rounded border border-slate-200 text-slate-600 font-bold">
-                                      {doc.client_doc_type === '6' ? 'RUC' : doc.client_doc_type === '1' ? 'DNI' : 'DOC'}
-                                    </span>
-                                    <span>{doc.client_doc_number || '-'}</span>
-                                    {(doc.document_type === '07' || doc.document_type === '08') && doc.ref_series && doc.ref_number && (
-                                      <span className="font-bold text-indigo-700 bg-indigo-50 px-1.5 py-0.2 rounded border border-indigo-200">
-                                        Modifica: {doc.ref_series}-{doc.ref_number}
-                                      </span>
-                                    )}
-                                  </div>
-                                </div>
+                            <td className="py-3 px-4 font-semibold text-slate-800">
+                              <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-bold ${doc.document_type === '01' ? 'bg-blue-50 text-blue-800 border border-blue-200' :
+                                doc.document_type === '03' ? 'bg-emerald-50 text-emerald-800 border border-emerald-200' :
+                                  doc.document_type === '07' ? 'bg-rose-50 text-rose-800 border border-rose-200' :
+                                    doc.document_type === '08' ? 'bg-purple-50 text-purple-800 border border-purple-200' :
+                                      'bg-teal-50 text-teal-800 border border-teal-200'
+                                }`}>
+                                {doc.document_type === '01' ? 'Factura' : doc.document_type === '03' ? 'Boleta' : doc.document_type === '07' ? 'Nota Crédito' : doc.document_type === '08' ? 'Nota Débito' : 'Guía Remisión'}
+                              </span>
+                            </td>
+                            <td className="py-3 px-4">
+                              <div className="font-semibold text-slate-900">{doc.client_name}</div>
+                              <div className="text-[10px] text-slate-400 font-mono flex items-center gap-1.5 flex-wrap">
+                                <span>{doc.client_doc_number}</span>
+                                {(doc.document_type === '07' || doc.document_type === '08') && doc.ref_series && doc.ref_number && (
+                                  <span className="font-bold text-indigo-600 bg-indigo-50 px-1.5 py-0.2 rounded border border-indigo-200">
+                                    Modifica: {doc.ref_series}-{doc.ref_number}
+                                  </span>
+                                )}
                               </div>
                             </td>
-
-                            {/* COLUMNA 3: FECHA / HORA */}
-                            <td className="py-3.5 px-4 font-mono text-slate-600 text-[11px]">
-                              <div className="font-bold text-slate-800">{doc.issue_date}</div>
-                              <div className="text-[10px] text-slate-400">{doc.issue_time || '00:00:00'}</div>
+                            <td className="py-3 px-4 text-slate-500 font-mono text-[11px]">
+                              {doc.issue_date} {doc.issue_time}
                             </td>
-
-                            {/* COLUMNA 4: TOTAL Y SALDO CONTABLE */}
-                            <td className="py-3.5 px-4 text-right font-mono">
-                              <div className="font-black text-slate-900 text-sm">
+                            <td className="py-3 px-4 text-right font-mono">
+                              <div className="font-bold text-slate-900">
                                 {doc.currency === 'USD' ? '$' : 'S/'} {Number(doc.total_amount).toFixed(2)}
                               </div>
-                              {commStatus.hasAdjustments ? (
-                                <div className={`inline-block text-[10px] font-black px-1.5 py-0.5 rounded border mt-0.5 ${
-                                  commStatus.saldo <= 0.009
-                                    ? 'bg-rose-50 text-rose-700 border-rose-200'
-                                    : 'bg-emerald-50 text-emerald-700 border-emerald-200'
-                                }`}>
-                                  {commStatus.saldo <= 0.009
-                                    ? 'Saldo: S/ 0.00 (Liquidado)'
-                                    : `Saldo: ${doc.currency === 'USD' ? '$' : 'S/'} ${commStatus.saldo.toFixed(2)}`}
-                                </div>
-                              ) : (
-                                <div className="text-[10px] text-slate-400 font-medium">
-                                  Saldo: 100%
+                              {commStatus.hasAdjustments && (
+                                <div className={`text-[10px] font-black mt-0.5 ${commStatus.saldo <= 0.01 ? 'text-rose-600' : 'text-emerald-600'}`}>
+                                  {commStatus.saldo <= 0.01 ? 'Saldo: S/ 0.00 (Liquidado)' : `Saldo: ${doc.currency === 'USD' ? '$' : 'S/'} ${commStatus.saldo.toFixed(2)}`}
                                 </div>
                               )}
                             </td>
-
-                            {/* COLUMNA 5: ESTADO COMERCIAL / OPERATIVO */}
-                            <td className="py-3.5 px-4 text-center">
+                            {/* ESTADO COMERCIAL / OPERATIVO */}
+                            <td className="py-3 px-4 text-center">
                               <div className="flex flex-col items-center gap-0.5">
                                 <span className={`text-[10px] font-black px-2.5 py-0.5 rounded-full uppercase border shadow-2xs ${commStatus.badgeClass}`}>
                                   {commStatus.badge}
@@ -4685,9 +4511,8 @@ export function App() {
                                 </span>
                               </div>
                             </td>
-
-                            {/* COLUMNA 6: ESTADO SUNAT ESTRICTO (RESPUESTA OFICIAL SUNAT) */}
-                            <td className="py-3.5 px-4 text-center">
+                            {/* ESTADO SUNAT ESTRICTO (ESTRICTAMENTE LO RESPONDIDO POR SUNAT) */}
+                            <td className="py-3 px-4 text-center">
                               <button
                                 type="button"
                                 onClick={() => setDiagnosticDoc(doc)}
@@ -4698,12 +4523,10 @@ export function App() {
                                 <Info className="w-2.5 h-2.5 opacity-70" />
                               </button>
                             </td>
-
-                            {/* COLUMNA 7: ACCIONES */}
-                            <td className="py-3.5 px-4 text-right">
+                            <td className="py-3 px-4 text-right">
                               <div className="flex items-center justify-end gap-1.5">
                                 {/* Clúster 1: Representación Impresa y Descargas */}
-                                <div className="bg-slate-100/90 p-0.5 rounded-xl border border-slate-200/80 flex items-center shadow-2xs">
+                                <div className="bg-slate-100/80 p-0.5 rounded-xl border border-slate-200/60 flex items-center shadow-2xs">
                                   <button
                                     onClick={() => openPreview(doc)}
                                     className="p-1.5 text-slate-600 hover:text-slate-900 hover:bg-white rounded-lg transition-all cursor-pointer"
@@ -4809,10 +4632,10 @@ export function App() {
                             </td>
                           </tr>
 
-                          {/* PANEL EJECUTIVO DE RESUMEN DE MODIFICACIONES Y TRAZABILIDAD */}
+                          {/* PANEL EJECUTIVO DE RESUMEN DE MODIFICACIONES Y TRAZABILIDAD (SIN ENTRAR BOLETA POR BOLETA) */}
                           {isExpanded && notes.length > 0 && (
                             <tr className="bg-slate-50/90 border-y-2 border-indigo-200">
-                              <td colSpan={7} className="p-4 sm:p-5">
+                              <td colSpan={8} className="p-4 sm:p-5">
                                 <div className="bg-white rounded-2xl border border-indigo-100 shadow-xs p-4.5 space-y-4">
                                   {/* HEADER DE TRAZABILIDAD */}
                                   <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-100">
@@ -4879,9 +4702,8 @@ export function App() {
                                         <div key={note.id || nIdx} className="bg-slate-50/70 border border-slate-200 rounded-xl p-3.5 space-y-2.5">
                                           <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
                                             <div className="flex items-center gap-2 flex-wrap">
-                                              <span className={`text-[10px] font-black px-2 py-0.5 rounded uppercase tracking-wide border ${
-                                                isNC ? 'bg-rose-100 text-rose-800 border-rose-200' : 'bg-blue-100 text-blue-800 border border-blue-200'
-                                              }`}>
+                                              <span className={`text-[10px] font-black px-2 py-0.5 rounded uppercase tracking-wide border ${isNC ? 'bg-rose-100 text-rose-800 border-rose-200' : 'bg-blue-100 text-blue-800 border border-blue-200'
+                                                }`}>
                                                 {isNC ? 'Nota de Crédito' : 'Nota de Débito'}
                                               </span>
                                               <span className="font-mono font-black text-indigo-700 text-sm">{note.full_number}</span>
@@ -5001,7 +4823,7 @@ export function App() {
                     })}
                     {groupedDocTree.length === 0 && (
                       <tr>
-                        <td colSpan={7} className="py-12 text-center text-slate-400">
+                        <td colSpan={8} className="py-12 text-center text-slate-400">
                           No se encontraron comprobantes con los filtros seleccionados.
                         </td>
                       </tr>
@@ -5342,8 +5164,8 @@ export function App() {
                       <p className="text-xs text-slate-500 mt-1">{comp.direccion}</p>
                     </div>
                     <span className={`text-xs px-2.5 py-1 rounded-full font-bold shrink-0 ${comp.env_mode === 'PRODUCCION'
-                        ? 'bg-rose-50 text-rose-700 border border-rose-200'
-                        : 'bg-amber-50 text-amber-700 border border-amber-200'
+                      ? 'bg-rose-50 text-rose-700 border border-rose-200'
+                      : 'bg-amber-50 text-amber-700 border border-amber-200'
                       }`}>
                       {comp.env_mode}
                     </span>
@@ -5490,8 +5312,8 @@ export function App() {
                     <button
                       onClick={() => setCurrentCompany(comp)}
                       className={`ml-auto text-xs px-3 py-1.5 rounded-xl font-bold transition cursor-pointer ${currentCompany?.id === comp.id
-                          ? 'bg-emerald-600 text-white shadow-xs'
-                          : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                        ? 'bg-emerald-600 text-white shadow-xs'
+                        : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
                         }`}
                     >
                       {currentCompany?.id === comp.id ? '✓ Emisor Activo' : 'Seleccionar'}
@@ -6107,8 +5929,8 @@ Idempotency-Key: cco_order_987654 (Opcional pero recomendado para cero duplicado
         const diagGradient = isAccepted
           ? 'bg-gradient-to-br from-emerald-500 to-teal-600 text-white shadow-emerald-500/25 ring-emerald-100'
           : isQueued
-          ? 'bg-gradient-to-br from-amber-500 to-orange-600 text-white shadow-amber-500/25 ring-amber-100'
-          : 'bg-gradient-to-br from-rose-500 to-red-600 text-white shadow-rose-500/25 ring-rose-100';
+            ? 'bg-gradient-to-br from-amber-500 to-orange-600 text-white shadow-amber-500/25 ring-amber-100'
+            : 'bg-gradient-to-br from-rose-500 to-red-600 text-white shadow-rose-500/25 ring-rose-100';
 
         return (
           <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-md flex items-center justify-center p-4 animate-in fade-in duration-200">
@@ -6590,13 +6412,10 @@ Idempotency-Key: cco_order_987654 (Opcional pero recomendado para cero duplicado
                   <span className="text-[10px] font-bold text-slate-400 uppercase block tracking-wider">Total Orig</span>
                   <span className="font-mono font-bold text-slate-700 text-xs block">S/ {Number(manualNoteModal.doc.total_amount).toFixed(2)}</span>
                 </div>
-                <div
-                  className={`p-2 rounded-xl border ${
-                    manualNoteModal.remainingBalance <= 0.009
-                      ? 'bg-rose-50 border-rose-200 text-rose-700'
-                      : 'bg-emerald-50 border-emerald-200 text-emerald-800'
-                  }`}
-                >
+                <div className={`p-2 rounded-xl border ${manualNoteModal.remainingBalance <= 0.009
+                  ? 'bg-rose-50 border-rose-200 text-rose-700'
+                  : 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                  }`}>
                   <span className="text-[10px] font-black uppercase block tracking-wider">Saldo Remanente</span>
                   <span className="font-mono font-black text-xs sm:text-sm block">S/ {manualNoteModal.remainingBalance.toFixed(2)}</span>
                 </div>
@@ -6628,11 +6447,10 @@ Idempotency-Key: cco_order_987654 (Opcional pero recomendado para cero duplicado
                       amount: prev.remainingBalance,
                     }));
                   }}
-                  className={`py-2 px-3 text-xs font-black rounded-xl transition-all flex items-center justify-center gap-1.5 ${
-                    manualNoteModal.noteType === '07'
-                      ? 'bg-white text-rose-600 shadow-sm border border-rose-100 ring-1 ring-black/5'
-                      : 'text-slate-500 hover:text-slate-800'
-                  }`}
+                  className={`py-2 px-3 text-xs font-black rounded-xl transition-all flex items-center justify-center gap-1.5 ${manualNoteModal.noteType === '07'
+                    ? 'bg-white text-rose-600 shadow-sm border border-rose-100 ring-1 ring-black/5'
+                    : 'text-slate-500 hover:text-slate-800'
+                    }`}
                 >
                   <Receipt className="w-3.5 h-3.5" />
                   Nota de Crédito (Tipo 07)
@@ -6649,11 +6467,10 @@ Idempotency-Key: cco_order_987654 (Opcional pero recomendado para cero duplicado
                       amount: 10,
                     }));
                   }}
-                  className={`py-2 px-3 text-xs font-black rounded-xl transition-all flex items-center justify-center gap-1.5 ${
-                    manualNoteModal.noteType === '08'
-                      ? 'bg-white text-purple-600 shadow-sm border border-purple-100 ring-1 ring-black/5'
-                      : 'text-slate-500 hover:text-slate-800'
-                  }`}
+                  className={`py-2 px-3 text-xs font-black rounded-xl transition-all flex items-center justify-center gap-1.5 ${manualNoteModal.noteType === '08'
+                    ? 'bg-white text-purple-600 shadow-sm border border-purple-100 ring-1 ring-black/5'
+                    : 'text-slate-500 hover:text-slate-800'
+                    }`}
                 >
                   <FileSpreadsheet className="w-3.5 h-3.5" />
                   Nota de Débito (Tipo 08)
@@ -6738,11 +6555,10 @@ Idempotency-Key: cco_order_987654 (Opcional pero recomendado para cero duplicado
                       const maxVal = manualNoteModal.noteType === '07' ? manualNoteModal.remainingBalance : 999999999;
                       setManualNoteModal(prev => ({ ...prev, amount: Math.min(val, maxVal) }));
                     }}
-                    className={`w-full text-xs font-mono font-bold border rounded-xl p-2.5 transition-all outline-none ${
-                      manualNoteModal.noteType === '07' && (['01', '02', '06'].includes(manualNoteModal.reasonCode) || manualNoteModal.reasonCode === '03')
-                        ? 'bg-slate-100 text-slate-500 border-slate-300 cursor-not-allowed shadow-inner'
-                        : 'bg-white text-slate-900 border-slate-200 focus:ring-4 focus:ring-purple-500/15 focus:border-purple-400'
-                    }`}
+                    className={`w-full text-xs font-mono font-bold border rounded-xl p-2.5 transition-all outline-none ${manualNoteModal.noteType === '07' && (['01', '02', '06'].includes(manualNoteModal.reasonCode) || manualNoteModal.reasonCode === '03')
+                      ? 'bg-slate-100 text-slate-500 border-slate-300 cursor-not-allowed shadow-inner'
+                      : 'bg-white text-slate-900 border-slate-200 focus:ring-4 focus:ring-purple-500/15 focus:border-purple-400'
+                      }`}
                   />
                   {manualNoteModal.noteType === '07' && (
                     <p className="text-[10px] text-slate-500 mt-1.5 font-medium leading-tight">
@@ -6798,10 +6614,10 @@ Idempotency-Key: cco_order_987654 (Opcional pero recomendado para cero duplicado
       {feedbackAlert && (
         <div className="fixed bottom-6 right-6 z-50 animate-in slide-in-from-bottom duration-300 max-w-md">
           <div className={`p-4 rounded-2xl shadow-2xl border flex items-start gap-3 ${feedbackAlert.type === 'success'
-              ? 'bg-slate-900 text-white border-emerald-500/50'
-              : feedbackAlert.type === 'error'
-                ? 'bg-slate-900 text-white border-red-500/50'
-                : 'bg-slate-900 text-white border-indigo-500/50'
+            ? 'bg-slate-900 text-white border-emerald-500/50'
+            : feedbackAlert.type === 'error'
+              ? 'bg-slate-900 text-white border-red-500/50'
+              : 'bg-slate-900 text-white border-indigo-500/50'
             }`}>
             <div className="mt-0.5 shrink-0">
               {feedbackAlert.type === 'success' ? (
