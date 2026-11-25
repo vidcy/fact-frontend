@@ -48,6 +48,7 @@ import { AdminLogin } from './components/AdminLogin';
 import { ConfirmModal } from './components/ConfirmModal';
 import { UsersManagement } from './components/UsersManagement';
 import { SeriesModal } from './components/SeriesModal';
+import { SunatTaxAuditView } from './components/SunatTaxAuditView';
 
 // ============================================================================
 // CONSTANTES GLOBALES Y URL DE API (SOPORTA LOCALHOST Y VERCEL PRODUCTION)
@@ -155,7 +156,7 @@ export function App() {
   });
 
   // 2. Navegación Principal por Pestañas
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'emitir' | 'documentos' | 'guias' | 'colas' | 'empresas' | 'usuarios' | 'api' | 'consola' | 'guia_sunat'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'emitir' | 'documentos' | 'guias' | 'colas' | 'empresas' | 'usuarios' | 'api' | 'consola' | 'guia_sunat' | 'tributario'>('dashboard');
 
   // 3. Empresas y Emisor Activo Multi-Tenant
   const [companies, setCompanies] = useState<Company[]>([]);
@@ -244,23 +245,56 @@ export function App() {
     }
 
     const notesMap: Record<string, DocumentRecord[]> = {};
+    const guiasMap: Record<string, DocumentRecord[]> = {};
+
     safeDocs.forEach((d) => {
       if (!d) return;
       if ((d.document_type === '07' || d.document_type === '08') && d.ref_series && d.ref_number) {
         const parentKey = `${d.ref_series}-${d.ref_number}`.toUpperCase();
+        const paddedParentKey = `${d.ref_series}-${String(d.ref_number).padStart(8, '0')}`.toUpperCase();
         if (!notesMap[parentKey]) notesMap[parentKey] = [];
         notesMap[parentKey].push(d);
+        if (parentKey !== paddedParentKey) {
+          if (!notesMap[paddedParentKey]) notesMap[paddedParentKey] = [];
+          notesMap[paddedParentKey].push(d);
+        }
+      }
+      if (d.document_type === '09') {
+        let parentKey: string | null = null;
+        if (d.ref_series && d.ref_number) {
+          parentKey = `${d.ref_series}-${String(d.ref_number).padStart(8, '0')}`.toUpperCase();
+        } else if (d.sunat_description) {
+          const match = d.sunat_description.match(/\[Ref:\s*([A-Za-z0-9]+-[A-Za-z0-9]+)\]/i);
+          if (match) parentKey = match[1].toUpperCase();
+        }
+        if (parentKey) {
+          if (!guiasMap[parentKey]) guiasMap[parentKey] = [];
+          guiasMap[parentKey].push(d);
+        }
       }
     });
 
     const rootList: DocumentRecord[] = [];
     sortedMatchingDocs.forEach((d) => {
       if (!d) return;
-      if (d.document_type === '01' || d.document_type === '03' || d.document_type === '09') {
+      if (d.document_type === '01' || d.document_type === '03') {
         rootList.push(d);
+      } else if (d.document_type === '09') {
+        // Una Guía de Remisión solo es raíz si NO tiene comprobante padre vinculado en el sistema
+        let parentKey: string | null = null;
+        if (d.ref_series && d.ref_number) {
+          parentKey = `${d.ref_series}-${String(d.ref_number).padStart(8, '0')}`.toUpperCase();
+        } else if (d.sunat_description) {
+          const match = d.sunat_description.match(/\[Ref:\s*([A-Za-z0-9]+-[A-Za-z0-9]+)\]/i);
+          if (match) parentKey = match[1].toUpperCase();
+        }
+        const parentExists = parentKey && safeDocs.some((p) => p && p.full_number?.toUpperCase() === parentKey);
+        if (!parentExists) {
+          rootList.push(d);
+        }
       } else if (d.document_type === '07' || d.document_type === '08') {
-        const parentKey = d.ref_series && d.ref_number ? `${d.ref_series}-${d.ref_number}`.toUpperCase() : null;
-        const parentExists = parentKey && safeDocs.some((p) => p && `${p.series || ''}-${p.number || ''}`.toUpperCase() === parentKey);
+        const parentKey = d.ref_series && d.ref_number ? `${d.ref_series}-${String(d.ref_number).padStart(8, '0')}`.toUpperCase() : null;
+        const parentExists = parentKey && safeDocs.some((p) => p && p.full_number?.toUpperCase() === parentKey);
         // Si no tiene expediente padre en el sistema, se lista para no perder visibilidad
         if (!parentExists) {
           rootList.push(d);
@@ -272,10 +306,13 @@ export function App() {
 
     return rootList.map((root) => {
       const parentKey = `${root.series || ''}-${root.number || ''}`.toUpperCase();
-      const linkedNotes = (notesMap[parentKey] || []).sort((a, b) => getDocTimestamp(b) - getDocTimestamp(a));
+      const paddedParentKey = `${root.series || ''}-${String(root.number || '').padStart(8, '0')}`.toUpperCase();
+      const linkedNotes = (notesMap[paddedParentKey] || notesMap[parentKey] || []).sort((a, b) => getDocTimestamp(b) - getDocTimestamp(a));
+      const linkedGuias = (guiasMap[paddedParentKey] || guiasMap[parentKey] || []).sort((a, b) => getDocTimestamp(b) - getDocTimestamp(a));
       return {
         doc: root,
         notes: linkedNotes,
+        guias: linkedGuias,
       };
     });
   }, [documents, docFilterType, docFilterStatus, docFilterStartDate, docFilterEndDate, docSearchTerm, docViewMode]);
@@ -628,6 +665,7 @@ export function App() {
   const [conductorNombre, setConductorNombre] = useState('');
   const [conductorLicencia, setConductorLicencia] = useState('');
   const [vehiculoPlaca, setVehiculoPlaca] = useState('');
+  const [vehiculoMenor2Ton, setVehiculoMenor2Ton] = useState(false);
 
   // 8. Referencias Tributarias para Notas de Crédito (07) y Débito (08)
   const [refDocType, setRefDocType] = useState<'01' | '03'>('03');
@@ -826,7 +864,12 @@ export function App() {
     setClientDocType(found.client_doc_type || (targetRefType === '01' ? '6' : '1'));
     setClientDocNumber(found.client_doc_number || '');
     setClientName(found.client_name || '');
-    if (found.client_address) setClientAddress(found.client_address);
+    if (found.client_address) {
+      setClientAddress(found.client_address);
+      if (docType === '09' || !puntoLlegadaDireccion) {
+        setPuntoLlegadaDireccion(found.client_address);
+      }
+    }
     if (found.client_email) setClientEmail(found.client_email);
     setCurrency((found.currency as any) || 'PEN');
 
@@ -1349,6 +1392,14 @@ export function App() {
         if (!transportistaNombre.trim()) {
           errors.push(`Razón social de la empresa transportista es obligatoria.`);
         }
+        if (vehiculoMenor2Ton) {
+          if (!vehiculoPlaca.trim()) {
+            errors.push(`Vehículo < 2 Toneladas: Placa del vehículo de transporte es obligatoria según SUNAT.`);
+          }
+          if (!conductorDoc.trim() || conductorDoc.trim().length !== 8) {
+            errors.push(`Vehículo < 2 Toneladas: DNI de 8 dígitos del conductor es obligatorio.`);
+          }
+        }
       } else {
         if (!conductorDoc.trim() || conductorDoc.trim().length !== 8) {
           errors.push(`Transporte Privado: DNI de 8 dígitos del conductor es obligatorio.`);
@@ -1684,6 +1735,22 @@ export function App() {
           });
           return;
         }
+        if (vehiculoMenor2Ton) {
+          if (!vehiculoPlaca.trim()) {
+            setFeedbackAlert({
+              type: 'error',
+              message: 'Vehículo menor a 2 toneladas: Debe ingresar la placa del vehículo según normativa SUNAT.'
+            });
+            return;
+          }
+          if (!conductorDoc.trim() || conductorDoc.trim().length !== 8) {
+            setFeedbackAlert({
+              type: 'error',
+              message: 'Vehículo menor a 2 toneladas: Debe ingresar el DNI de 8 dígitos del conductor.'
+            });
+            return;
+          }
+        }
       } else {
         if (!conductorDoc.trim() || conductorDoc.trim().length !== 8) {
           setFeedbackAlert({
@@ -1763,6 +1830,18 @@ export function App() {
           razon_social: transportistaNombre.trim(),
           numero_mtc: transportistaMtc.trim() || undefined,
         };
+        if (vehiculoMenor2Ton) {
+          guiaPayload.vehiculo_menor_2_toneladas = true;
+          guiaPayload.conductor = {
+            tipo_documento: '1',
+            numero_documento: conductorDoc.trim(),
+            nombres: conductorNombre.trim(),
+            licencia: conductorLicencia.trim(),
+          };
+          guiaPayload.vehiculo = {
+            placa: vehiculoPlaca.trim().toUpperCase(),
+          };
+        }
       } else {
         guiaPayload.conductor = {
           tipo_documento: '1',
@@ -1777,6 +1856,14 @@ export function App() {
 
       payload.guia_datos = guiaPayload;
       payload.metadata = { guia_datos: guiaPayload };
+
+      if (linkedRefDoc) {
+        payload.ref_documento = {
+          tipo: linkedRefDoc.document_type,
+          serie: linkedRefDoc.series,
+          numero: linkedRefDoc.number,
+        };
+      }
     }
 
     const docName = docType === '01' ? 'Factura Electrónica' : docType === '03' ? 'Boleta de Venta Electrónica' : docType === '07' ? 'Nota de Crédito' : docType === '08' ? 'Nota de Débito' : 'Guía de Remisión Remitente (09)';
@@ -2638,6 +2725,19 @@ export function App() {
           <Truck className="w-4 h-4 text-indigo-600" /> Guías de Remisión ({documents.filter(d => d.document_type === '09').length})
         </button>
         <button
+          onClick={() => { setActiveTab('tributario'); fetchDocuments(); }}
+          className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${activeTab === 'tributario'
+            ? 'border-emerald-600 text-emerald-700 bg-emerald-50/50 font-black'
+            : 'border-transparent text-slate-600 hover:text-slate-900'
+            }`}
+        >
+          <Receipt className="w-4 h-4 text-emerald-600" />
+          <span>Responsabilidad Tributaria (621 / SIRE)</span>
+          <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-emerald-100 text-emerald-800 font-black uppercase">
+            SUNAT
+          </span>
+        </button>
+        <button
           onClick={() => { setActiveTab('empresas'); fetchCompanies(); }}
           className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition cursor-pointer ${activeTab === 'empresas'
             ? 'border-indigo-600 text-indigo-600 bg-indigo-50/40'
@@ -3226,30 +3326,46 @@ export function App() {
                     )}
                   </div>
 
-                  {/* SECCIÓN NOTAS DE CRÉDITO Y DÉBITO: VERIFICACIÓN Y CONSULTA EN VIVO A SUNAT */}
-                  {(docType === '07' || docType === '08') && (
+                  {/* SECCIÓN NOTAS Y GUÍAS: VERIFICACIÓN Y VINCULACIÓN EN VIVO A SUNAT */}
+                  {(docType === '07' || docType === '08' || docType === '09') && (
                     <div className="border-2 border-indigo-200/80 bg-gradient-to-br from-indigo-50/50 via-slate-50 to-white rounded-3xl p-5 md:p-6 shadow-sm space-y-5">
                       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-indigo-100 pb-3">
                         <div className="flex items-center gap-2.5">
-                          <div className="w-9 h-9 rounded-xl bg-indigo-600 text-white flex items-center justify-center font-black shadow-md shadow-indigo-600/20 shrink-0">
-                            <ShieldCheck className="w-5 h-5" />
+                          <div className={`w-9 h-9 rounded-xl ${docType === '09' ? 'bg-teal-600' : 'bg-indigo-600'} text-white flex items-center justify-center font-black shadow-md shrink-0`}>
+                            {docType === '09' ? <Truck className="w-5 h-5" /> : <ShieldCheck className="w-5 h-5" />}
                           </div>
                           <div>
                             <h3 className="text-slate-900 font-extrabold text-sm tracking-tight flex items-center gap-2">
-                              <span>Consulta y Verificación Oficial en SUNAT (En Vivo)</span>
+                              <span>{docType === '09' ? 'Comprobante de Venta Vinculado (Opcional - Boleta o Factura)' : 'Consulta y Verificación Oficial en SUNAT (En Vivo)'}</span>
                               <span className="text-[10px] bg-emerald-100 text-emerald-800 font-bold px-2 py-0.5 rounded-full border border-emerald-300 flex items-center gap-1">
                                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
-                                WebService billConsultService
+                                {docType === '09' ? 'Autocompletado de Carga y Destinatario' : 'WebService billConsultService'}
                               </span>
                             </h3>
                             <p className="text-xs text-slate-500 font-medium">
-                              Valida el comprobante original en los servidores de SUNAT para asegurar validez del CDR antes de emitir la {docType === '07' ? 'Nota de Crédito' : 'Nota de Débito'}.
+                              {docType === '09'
+                                ? 'Si el traslado ampara una venta previa, consulta y vincula la Boleta o Factura para verificarla en SUNAT y cargar automáticamente el destinatario y sus productos.'
+                                : `Valida el comprobante original en los servidores de SUNAT para asegurar validez del CDR antes de emitir la ${docType === '07' ? 'Nota de Crédito' : 'Nota de Débito'}.`}
                             </p>
                           </div>
                         </div>
-                        <span className="text-[11px] bg-indigo-100 text-indigo-800 font-bold px-3 py-1 rounded-full border border-indigo-200 shrink-0 self-start sm:self-auto">
-                          Catálogo {docType === '07' ? '09 NC' : '10 ND'} SUNAT
-                        </span>
+                        <div className="flex items-center gap-2">
+                          {docType === '09' && linkedRefDoc && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setLinkedRefDoc(null);
+                                setSunatConsultResult(null);
+                              }}
+                              className="text-[11px] bg-rose-50 hover:bg-rose-100 text-rose-700 font-bold px-2.5 py-1 rounded-xl border border-rose-200 transition cursor-pointer"
+                            >
+                              Quitar Vinculación
+                            </button>
+                          )}
+                          <span className="text-[11px] bg-indigo-100 text-indigo-800 font-bold px-3 py-1 rounded-full border border-indigo-200 shrink-0 self-start sm:self-auto">
+                            {docType === '07' ? 'Catálogo 09 NC' : docType === '08' ? 'Catálogo 10 ND' : 'Catálogo 20 GRE'} SUNAT
+                          </span>
+                        </div>
                       </div>
 
                       {/* Selector de Tipo (Pills) + Serie + Correlativo + Botón Consulta */}
@@ -3837,6 +3953,74 @@ export function App() {
                                 className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-slate-900 outline-none"
                               />
                             </div>
+                          </div>
+
+                          {/* Excepción normativa SUNAT: Vehículo menor a 2 toneladas */}
+                          <div className="pt-2 border-t border-indigo-100">
+                            <label className="flex items-center gap-2 cursor-pointer select-none">
+                              <input
+                                type="checkbox"
+                                checked={vehiculoMenor2Ton}
+                                onChange={(e) => setVehiculoMenor2Ton(e.target.checked)}
+                                className="w-4 h-4 rounded text-indigo-600 focus:ring-indigo-500 border-slate-300"
+                              />
+                              <span className="font-bold text-slate-800 text-[11px]">
+                                ¿Vehículo de transporte público menor a 2 toneladas (Categoría M1/N1)?
+                              </span>
+                            </label>
+                            <p className="text-[10px] text-slate-500 mt-0.5">
+                              SUNAT R.S. 123-2022: Si la carga es trasladada en un vehículo menor a 2 toneladas, es obligatorio consignar placa y conductor.
+                            </p>
+
+                            {vehiculoMenor2Ton && (
+                              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3 pt-2">
+                                <div>
+                                  <label className="block text-[11px] text-slate-500 font-medium mb-1">Placa Vehículo</label>
+                                  <input
+                                    type="text"
+                                    maxLength={7}
+                                    value={vehiculoPlaca}
+                                    onChange={(e) => setVehiculoPlaca(e.target.value.toUpperCase())}
+                                    placeholder="ABC-123"
+                                    className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 font-mono text-xs text-slate-900 outline-none"
+                                    required={vehiculoMenor2Ton}
+                                  />
+                                </div>
+                                <div>
+                                  <label className="block text-[11px] text-slate-500 font-medium mb-1">DNI Conductor (8 dígitos)</label>
+                                  <input
+                                    type="text"
+                                    maxLength={8}
+                                    value={conductorDoc}
+                                    onChange={(e) => setConductorDoc(e.target.value.replace(/\D/g, ''))}
+                                    placeholder="45678901"
+                                    className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 font-mono text-xs text-slate-900 outline-none"
+                                    required={vehiculoMenor2Ton}
+                                  />
+                                </div>
+                                <div>
+                                  <label className="block text-[11px] text-slate-500 font-medium mb-1">Nombres del Conductor</label>
+                                  <input
+                                    type="text"
+                                    value={conductorNombre}
+                                    onChange={(e) => setConductorNombre(e.target.value)}
+                                    placeholder="JUAN PEREZ CHOQUE"
+                                    className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-slate-900 outline-none"
+                                    required={vehiculoMenor2Ton}
+                                  />
+                                </div>
+                                <div>
+                                  <label className="block text-[11px] text-slate-500 font-medium mb-1">Licencia de Conducir</label>
+                                  <input
+                                    type="text"
+                                    value={conductorLicencia}
+                                    onChange={(e) => setConductorLicencia(e.target.value.toUpperCase())}
+                                    placeholder="Q12345678"
+                                    className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 font-mono text-xs text-slate-900 outline-none"
+                                  />
+                                </div>
+                              </div>
+                            )}
                           </div>
                         </div>
                       ) : (
@@ -4438,10 +4622,11 @@ export function App() {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
-                    {paginatedDocTree.map(({ doc, notes }) => {
+                    {paginatedDocTree.map(({ doc, notes, guias = [] }: any) => {
                       const officialSunat = getOfficialSunatStatus(doc);
                       const commStatus = getCommercialMovementStatus(doc, notes);
                       const isExpanded = !!expandedDocIds[doc.id];
+                      const totalLinked = notes.length + guias.length;
 
                       return (
                         <React.Fragment key={doc.id}>
@@ -4449,7 +4634,7 @@ export function App() {
                             <td className="py-3 px-4 font-mono font-bold text-indigo-600">
                               <div className="flex items-center gap-1.5 flex-wrap">
                                 <span>{doc.full_number}</span>
-                                {notes.length > 0 && (
+                                {totalLinked > 0 && (
                                   <button
                                     type="button"
                                     onClick={() => setExpandedDocIds(prev => ({ ...prev, [doc.id]: !prev[doc.id] }))}
@@ -4457,10 +4642,15 @@ export function App() {
                                       ? 'bg-indigo-600 text-white border-indigo-700'
                                       : 'bg-indigo-50 text-indigo-700 border-indigo-200 hover:bg-indigo-100'
                                       }`}
-                                    title="Ver panel ejecutivo de modificaciones, trazabilidad contable e ítems afectados"
+                                    title="Ver panel de trazabilidad, notas y guías vinculadas"
                                   >
                                     <Receipt className="w-3 h-3" />
-                                    <span>{notes.length} Ajuste(s)</span>
+                                    <span>{totalLinked} Vinculado(s)</span>
+                                    {guias.length > 0 && (
+                                      <span className="bg-sky-100 text-sky-800 text-[9px] px-1 rounded font-black">
+                                        GRE
+                                      </span>
+                                    )}
                                     <ChevronDown className={`w-3 h-3 transition-transform ${isExpanded ? 'rotate-180' : ''}`} />
                                   </button>
                                 )}
@@ -4633,7 +4823,7 @@ export function App() {
                           </tr>
 
                           {/* PANEL EJECUTIVO DE RESUMEN DE MODIFICACIONES Y TRAZABILIDAD (SIN ENTRAR BOLETA POR BOLETA) */}
-                          {isExpanded && notes.length > 0 && (
+                          {isExpanded && (notes.length > 0 || guias.length > 0) && (
                             <tr className="bg-slate-50/90 border-y-2 border-indigo-200">
                               <td colSpan={8} className="p-4 sm:p-5">
                                 <div className="bg-white rounded-2xl border border-indigo-100 shadow-xs p-4.5 space-y-4">
@@ -4645,9 +4835,9 @@ export function App() {
                                       </div>
                                       <div>
                                         <h4 className="font-extrabold text-slate-800 text-xs sm:text-sm flex items-center gap-2">
-                                          <span>Trazabilidad y Resumen de Ajustes Vinculados</span>
+                                          <span>Trazabilidad y Comprobantes Vinculados al Expediente</span>
                                           <span className="text-[11px] font-bold px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-800">
-                                            {notes.length} comprobante(s) de ajuste
+                                            {totalLinked} comprobante(s) vinculado(s)
                                           </span>
                                         </h4>
                                         <p className="text-[11px] text-slate-500">
@@ -4693,7 +4883,7 @@ export function App() {
 
                                   {/* LISTADO DE NOTAS CON ÍTEMS RESUMIDOS */}
                                   <div className="space-y-3">
-                                    {notes.map((note, nIdx) => {
+                                    {notes.map((note: any, nIdx: number) => {
                                       const isNC = note.document_type === '07';
                                       const officialNoteSunat = getOfficialSunatStatus(note);
                                       const noteItems = Array.isArray(note.items) ? note.items : [];
@@ -4786,7 +4976,7 @@ export function App() {
                                                   </tr>
                                                 </thead>
                                                 <tbody className="divide-y divide-slate-100 font-mono">
-                                                  {noteItems.map((it, idx) => (
+                                                  {noteItems.map((it: any, idx: number) => (
                                                     <tr key={it.id || idx} className="hover:bg-slate-50/50">
                                                       <td className="py-1 px-3 text-slate-400 text-[10px]">{it.code || `ITEM-${idx + 1}`}</td>
                                                       <td className="py-1 px-3 font-sans font-semibold text-slate-800">{it.description}</td>
@@ -5125,6 +5315,13 @@ export function App() {
           </div>
         )}
 
+
+        {/* ================================================================== */}
+        {/* TAB: RESPONSABILIDAD TRIBUTARIA & AUDITORÍA FISCAL SUNAT */}
+        {/* ================================================================== */}
+        {activeTab === 'tributario' && (
+          <SunatTaxAuditView documents={documents} activeCompany={currentCompany} />
+        )}
 
         {/* ================================================================== */}
         {/* TAB 4: EMPRESAS & NEGOCIOS MULTI-TENANT */}
